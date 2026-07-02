@@ -44,6 +44,31 @@ uv run --with pandas --with pyarrow python ~/work/vap_viewer/build/extract_error
 5. フレームレベルの指標を再計算し、json の tp/fp/tn/fn と**完全一致**を検証。
 6. cases.parquet / probs npz / tokens jsonl / meta.json を書き出し。
 
+## 視覚モデル(dev-hanakawa系統)への対応
+
+抽出器は import した vapx が提供する API を見て**系統を自動判別**します:
+
+- **lang系統**(dev_sakai/main): `predict_session(..., lang=...)` — 従来どおり
+- **視覚系統**(dev-hanakawa): `predict_session(..., vis_encoders=, vis_feats_a/b=,
+  vis_audio_ratio=)` — checkpoint の `vis_encoders` を復元し、config の
+  `gaze_dir/head_dir/au_dir`(npz, キー=`vis_role_a/b`)からセッション毎に特徴を供給
+
+実行は**先方の vapx リポジトリから**(その venv で)行います:
+
+```bash
+cd <hanakawa vapx>
+uv run --with pandas --with pyarrow python <vap_viewer>/build/extract_error_cases.py \
+    --recipe-dir egs/tabidachi/vap1 --exp-dir <exp> --split test --out <bundle>
+```
+
+前提: `zero_shot-test.json` が**視覚配線済みの評価コードで再生成済み**であること。
+
+注意: 視覚系統の vapx は評価に lang 配線が無いため、lang ブランチを持つモデル
+(`lang_dim > 0`)は **lang が供給されないまま**評価・抽出されます(警告を表示し、
+`meta.json` に `lang_eval_wired: false` を記録。json と整合するので一致検証は通り
+ますが、数値は lang 縮退値です)。セッション毎に実際に視覚特徴があったかは
+`meta.json` の `sessions[].vis` に記録されます(video無しセッションは空)。
+
 ## 一致検証が失敗したら
 
 - json が **lang未配線バグ修正前**に生成された → `vapx-zero-shot` で再生成。

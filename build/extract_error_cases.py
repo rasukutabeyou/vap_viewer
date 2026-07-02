@@ -322,6 +322,8 @@ def main(argv=None) -> int:
     # weights, ...) resolve from the recipe dir, exactly like vapx CLI runs.
     os.chdir(recipe_dir)
 
+    import inspect
+
     import torch
 
     from vapx.eval.events import find_shift_hold_events
@@ -331,12 +333,26 @@ def main(argv=None) -> int:
         TaskStores,
         ZeroShotConfig,
         _build_subset_masks,
-        _load_session_lang,
         _plan_cfg_hash,
         _plan_session,
         _score_session,
     )
     from vapx.inference import load_for_inference
+
+    # The extractor supports two vapx lineages, detected from what the
+    # installed vapx actually provides:
+    #   * lang-wired eval (dev_sakai / main): predict_session(..., lang=...)
+    #     and zero_shot._load_session_lang exist.
+    #   * visual-wired eval (dev-hanakawa): predict_session(...,
+    #     vis_encoders=, vis_feats_a/b=, vis_audio_ratio=) and
+    #     iter_session_inputs(..., gaze_dir=, ...) exist.
+    try:
+        from vapx.eval.zero_shot import _load_session_lang
+    except ImportError:
+        _load_session_lang = None
+    ps_params = set(inspect.signature(predict_session).parameters)
+    has_lang_eval = _load_session_lang is not None and "lang" in ps_params
+    has_vis_eval = "vis_encoders" in ps_params
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[extract] loading {ckpt_path} on {device}")
@@ -366,9 +382,40 @@ def main(argv=None) -> int:
 
     # Same lang detection as vapx.training.entry.zero_shot_main (post-fix).
     lang_rel = data_cfg.get("lang_dir") if hasattr(model, "lang_in_proj") else None
+    if lang_rel and not has_lang_eval:
+        # dev-hanakawa lineage: the model HAS a language branch but this
+        # vapx's eval cannot feed it -- zero-shot (and this bundle) score the
+        # model with the lang cross-attention idle. Consistent with the
+        # zero_shot json produced by the same code, so verification still
+        # passes, but the numbers are lang-degraded. Surface it loudly.
+        print("[extract] WARNING: model has a lang branch but this vapx has "
+              "no lang wiring in eval -> lang is NOT fed (degraded, matches "
+              "this vapx's zero_shot json). Tokens are not exported.")
+        lang_rel = None
     lang_dir = (base_dir / lang_rel) if lang_rel else None
     if lang_rel:
         print(f"[extract] language model; feeding lang features from {lang_dir}")
+
+    # Visual modalities (dev-hanakawa lineage): mirror zero_shot_main --
+    # rebuild the per-modality encoders and load their checkpoint weights.
+    vis_encoders: dict = {}
+    if has_vis_eval:
+        ckpt_vis = bundle["state"]["model"].get("vis_encoders", {})
+        for key, enc in (bundle.get("vis_encoders") or {}).items():
+            enc = enc.to(device)
+            if key in ckpt_vis:
+                enc.load_state_dict(ckpt_vis[key])
+            vis_encoders[key] = enc.eval()
+    vis_dirs = {k: data_cfg.get(k) for k in ("gaze_dir", "head_dir", "au_dir")}
+    use_vis = bool(has_vis_eval and vis_encoders and any(vis_dirs.values()))
+    vis_role_a = data_cfg.get("vis_role_a", "customer")
+    vis_role_b = data_cfg.get("vis_role_b", "operator")
+    vis_fps = data_cfg.get("vis_fps", 25.0)
+    vis_audio_ratio = max(1, round(float(zcfg.frame_hz) / float(vis_fps)))
+    if use_vis:
+        print(f"[extract] visual model; modalities={sorted(vis_encoders)} "
+              f"dirs={ {k: v for k, v in vis_dirs.items() if v} } "
+              f"roles=({vis_role_a},{vis_role_b}) ratio={vis_audio_ratio}")
 
     zs_saved = json.loads(zs_json_path.read_text())
     thresholds = {
@@ -393,15 +440,34 @@ def main(argv=None) -> int:
     all_rows: list[dict] = []
     sessions_meta: list[dict] = []
 
-    for i, (entry, wav, vad_full) in enumerate(
-            iter_session_inputs(entries, base_dir, sample_rate)):
+    if use_vis:
+        session_iter = iter_session_inputs(
+            entries, base_dir, sample_rate,
+            gaze_dir=vis_dirs["gaze_dir"], head_dir=vis_dirs["head_dir"],
+            au_dir=vis_dirs["au_dir"], role_a=vis_role_a, role_b=vis_role_b)
+    else:
+        session_iter = iter_session_inputs(entries, base_dir, sample_rate)
+
+    for i, item in enumerate(session_iter):
+        entry, wav, vad_full = item[0], item[1], item[2]
+        vis_a = item[3] if len(item) > 3 else None
+        vis_b = item[4] if len(item) > 4 else None
         sid = entry["id"]
+        fwd_kwargs: dict = {}
+        if lang_dir is not None:
+            fwd_kwargs["lang"] = _load_session_lang(lang_dir, sid)
+        if use_vis:
+            fwd_kwargs.update(
+                vis_encoders=vis_encoders,
+                vis_feats_a=vis_a, vis_feats_b=vis_b,
+                vis_audio_ratio=vis_audio_ratio,
+            )
         probs = predict_session(
             feature, model, wav,
             sample_rate=sample_rate,
             chunk_sec=args.chunk_sec, warmup_sec=args.warmup_sec,
             device=device,
-            lang=_load_session_lang(lang_dir, sid),
+            **fwd_kwargs,
         )
         T = min(probs.shape[0], vad_full.shape[0])
         plan = _plan_session(T, vad_full, zcfg)
@@ -439,12 +505,17 @@ def main(argv=None) -> int:
         n_sp = len(rows) - n_sh
         print(f"[extract] [{i + 1}/{len(entries)}] {sid}  T={T}  sh={n_sh}  spred+={n_sp}")
 
-        sessions_meta.append({
+        smeta = {
             "id": sid,
             "audio_l": entry.get("audio_l"), "audio_r": entry.get("audio_r"),
             "audio": entry.get("audio"),
             "duration": entry.get("duration"), "n_frames": int(T),
-        })
+        }
+        if use_vis:
+            # which modalities actually had features for this session
+            # (sessions without video run with the visual branches idle)
+            smeta["vis"] = sorted(set(vis_a or {}) | set(vis_b or {}))
+        sessions_meta.append(smeta)
 
     # ---- verification --------------------------------------------------
     verification = []
@@ -506,6 +577,13 @@ def main(argv=None) -> int:
         "forward": {"chunk_sec": args.chunk_sec, "warmup_sec": args.warmup_sec},
         "sample_rate": sample_rate,
         "lang_dir": lang_rel,
+        "lang_eval_wired": has_lang_eval,
+        "vis": ({
+            "modalities": sorted(vis_encoders),
+            "dirs": {k: v for k, v in vis_dirs.items() if v},
+            "roles": [vis_role_a, vis_role_b],
+            "vis_audio_ratio": vis_audio_ratio,
+        } if use_vis else None),
         "has_tokens": bool(token_exporter is not None and tokens_ok),
         "tokenizer": token_exporter.tokenizer_name if token_exporter else None,
         "n_sessions": len(sessions_meta),
