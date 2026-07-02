@@ -121,24 +121,51 @@ def _panel_vad(ax, vad, frame_hz, t0, t1):
     ax.set_yticklabels(["A", "B"], fontsize=8)
 
 
-def _panel_events(ax, cases_win, selected_key, zcfg, frame_hz):
-    """All same-task events inside the window; the selected one is bold."""
+def _panel_events(ax, cases_win, selected_key, zcfg, frame_hz, models=None):
+    """All same-task events inside the window; the selected one is bold.
+
+    Single model (``models`` is None): eval window colored by OK/NG, text
+    ``G:<gold> P:<pred> OK/NG``. Comparison (``models`` = bundle names,
+    ``cases_win`` = joined table with ``pred_<m>``/``correct_<m>``): gold on
+    top in ink, below it one line per model in that model's overlay color
+    (S○ / H× ... ○=正解 ×=誤り; shift_pred: TP / FN)."""
     ax.set_ylim(0, 1)
     ax.set_yticks([])
+    n_mod = len(models) if models else 0
     for _, c in cases_win.iterrows():
         sel = c["event_key"] == selected_key
-        col = COL_OK if c["correct"] else COL_NG
         ss, se = c["silence_start"] / frame_hz, c["silence_end"] / frame_hz
-        ax.axvspan(ss, se, color=MUTED, alpha=0.15 if not sel else 0.28, lw=0)
+        ax.axvspan(ss, se, color=MUTED, alpha=0.28 if sel else 0.15, lw=0)
         ws, we = _eval_window_sec(c, zcfg, frame_hz)
-        ax.axvspan(ws, we, color=col, alpha=0.55 if sel else 0.3, lw=0)
-        if c["task"] == "shift_hold":
-            txt = f"G:{c['gold']} P:{c['pred']} {'OK' if c['correct'] else 'NG'}"
+        is_sh = c["task"] == "shift_hold"
+        gold = c["gold"] if is_sh else "S"
+        x = (ws + we) / 2
+        fs = 8 if sel else 7
+        if models:
+            ax.axvspan(ws, we, color=INK, alpha=0.32 if sel else 0.15, lw=0)
+            ax.text(x, 0.86, f"G:{gold}", ha="center", fontsize=fs, color=INK,
+                    fontweight="bold", clip_on=True)
+            ys = np.linspace(0.60, 0.10, n_mod) if n_mod > 1 else [0.35]
+            for (m, y, col) in zip(models, ys, MODEL_COLORS):
+                if f"correct_{m}" not in c:
+                    continue          # joined table lacks this model
+                corr = bool(c[f"correct_{m}"])
+                if is_sh:
+                    txt = f"{c[f'pred_{m}']}{'○' if corr else '×'}"
+                else:
+                    txt = "TP○" if corr else "FN×"
+                ax.text(x, y, txt, ha="center", fontsize=fs, color=col,
+                        fontweight="bold" if sel else "normal", clip_on=True)
         else:
-            txt = f"S-pred {'TP' if c['correct'] else 'FN'}"
-        ax.text((ws + we) / 2, 0.78 if sel else 0.18, txt,
-                ha="center", fontsize=8 if sel else 7, clip_on=True,
-                fontweight="bold" if sel else "normal", color=col)
+            col = COL_OK if c["correct"] else COL_NG
+            ax.axvspan(ws, we, color=col, alpha=0.55 if sel else 0.3, lw=0)
+            if is_sh:
+                txt = f"G:{gold} P:{c['pred']} {'OK' if c['correct'] else 'NG'}"
+            else:
+                txt = f"G:{gold} {'TP' if c['correct'] else 'FN'}"
+            ax.text(x, 0.78 if sel else 0.18, txt,
+                    ha="center", fontsize=fs, clip_on=True,
+                    fontweight="bold" if sel else "normal", color=col)
 
 
 def _panel_bins(ax, bin_probs, case, zcfg, frame_hz, bin_times, t0, t1):
@@ -198,6 +225,72 @@ def _panel_task_score(ax, probs, case, frame_hz, t0, t1):
     ax.legend(loc="upper right", fontsize=7, frameon=False, ncol=2)
 
 
+def _pshift_curve(probs: dict, case: dict) -> np.ndarray:
+    """Per-frame curve oriented so that UP always means SHIFT for this event.
+
+    shift_hold: P(shift) = s_other / (s_A + s_B) -- the same ratio whose
+    eval-window mean is the case score. shift_pred: the raw subset score of
+    the incoming (post) speaker, which is what the threshold applies to."""
+    if case["task"] == "shift_hold":
+        other = 1 - int(case["pre_speaker"])
+        s = probs["score_sh"]
+        return s[:, other] / np.clip(s[:, 0] + s[:, 1], 1e-9, None)
+    return probs["score_spred"][:, int(case["post_speaker"])]
+
+
+def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
+    """SHIFT-oriented decision panel: curve above its (dashed) threshold in
+    the shaded eval window = that model predicted SHIFT."""
+    a, b = int(max(0, t0 * frame_hz)), int(t1 * frame_hz) + 1
+    ws, we = _eval_window_sec(case, zcfg, frame_hz)
+    ax.axvspan(ws, we, color=MUTED, alpha=0.18, lw=0)
+
+    is_sh = case["task"] == "shift_hold"
+    ymax = 0.25
+    if overlays:
+        for i, (ov, col) in enumerate(zip(overlays, MODEL_COLORS)):
+            curve = _pshift_curve(ov["probs"], case)
+            t = np.arange(a, min(b, len(curve))) / frame_hz
+            y = curve[a: a + len(t)]
+            ax.plot(t, y, color=col, lw=2, label=ov["name"])
+            thr = ov.get("threshold")
+            if thr is not None and thr == thr:
+                ax.axhline(thr, color=col, lw=1, ls="--", alpha=0.8)
+            if len(y):
+                ymax = max(ymax, float(y.max()))
+            if is_sh:
+                letter = str(ov.get("pred", "?"))
+            else:
+                letter = "TP○" if ov.get("correct") else "FN×"
+            ax.text(we + 0.05, 0.9 - 0.28 * i, letter, color=col,
+                    fontsize=9, fontweight="bold", clip_on=True,
+                    transform=ax.get_xaxis_transform())
+        ax.legend(loc="upper right", fontsize=7, frameon=False, ncol=2)
+    else:
+        curve = _pshift_curve(probs, case)
+        t = np.arange(a, min(b, len(curve))) / frame_hz
+        y = curve[a: a + len(t)]
+        ax.plot(t, y, color=INK, lw=2)
+        thr = case.get("threshold")
+        if thr is not None and thr == thr:
+            ax.axhline(thr, color=INK, lw=1, ls="--", alpha=0.8)
+            ax.text(t1, thr, f" thr={thr:.3f}", fontsize=7, color=INK,
+                    va="bottom", ha="right")
+        if len(y):
+            ymax = max(ymax, float(y.max()))
+
+    if is_sh:
+        ax.set_ylim(0, 1)
+        ax.set_yticks([0, 0.5, 1])
+        note = "P(SHIFT)  ↑=SHIFT予測 / ↓=HOLD予測 (破線=閾値)"
+    else:
+        ax.set_ylim(-0.02, ymax * 1.1)
+        note = "S-predスコア(相手話者)  破線閾値より上=SHIFT予測"
+    ax.text(0.003, 0.84, note, transform=ax.transAxes,
+            fontsize=8, color=INK, fontweight="bold",
+            bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
+
+
 def _panel_prob(ax, curve, frame_hz, t0, t1, label, overlays=None):
     """p_now / p_future. >0.5 = A dominates (blue fill), <0.5 = B (orange)."""
     a, b = int(max(0, t0 * frame_hz)), int(t1 * frame_hz) + 1
@@ -218,7 +311,8 @@ def _panel_prob(ax, curve, frame_hz, t0, t1, label, overlays=None):
     ax.set_ylim(0, 1)
     ax.set_yticks([0, 0.5, 1])
     ax.text(0.003, 0.82, label, transform=ax.transAxes, fontsize=9,
-            color=INK, fontweight="bold")
+            color=INK, fontweight="bold",
+            bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
 
 
 # --------------------------------------------------------------------------
@@ -238,50 +332,85 @@ def detail_figure(
     wav_sr: int | None = None,
     wav_t0: float = 0.0,
     tokens=None,
-    overlays: list[tuple[str, dict]] | None = None,
+    token_sets: list[tuple[str, object]] | None = None,
+    overlays: list[dict] | None = None,
 ):
     """One figure, panels top to bottom (only those with data):
-    wave A / wave B / VAD / events / bin heatmap / tokens / task score /
-    p_now / p_future. All share the time axis [t0, t1] (seconds)."""
+    wave A / wave B / VAD / events / bin heatmap / tokens (one panel per
+    entry of ``token_sets``) / task score (single-model only) / P(SHIFT) /
+    p_now / p_future. All share the time axis [t0, t1] (seconds).
+
+    ``token_sets``: ``[(label, tokens_df), ...]`` -- comparison mode passes
+    one entry per distinct lang feature set so token contents can be
+    compared across models on the same time axis. ``tokens`` (single df)
+    is the single-model shorthand.
+
+    ``overlays`` (comparison mode): ``[{name, probs, threshold, pred,
+    correct}, ...]`` -- one entry per model, first entry = primary bundle."""
+    if token_sets is None and tokens is not None:
+        token_sets = [("", tokens)]
+    token_sets = [(lbl, t) for lbl, t in (token_sets or []) if t is not None]
     _setup_fonts()
     frame_hz = float(meta["frame_hz"])
     zcfg = meta["zero_shot_config"]
     bin_times = meta.get("bin_times_sec") or [0.2, 0.4, 0.6, 0.8]
 
+    model_names = [o["name"] for o in overlays] if overlays else None
+    events_h = 0.8 if not overlays else min(1.7, 0.75 + 0.25 * len(overlays))
+
     panels: list[tuple[str, float]] = []
     if wav is not None:
         panels += [("wave_a", 1.4), ("wave_b", 1.4)]
-    panels += [("vad", 0.8), ("events", 0.8), ("bins", 0.9)]
-    if tokens is not None:
-        panels += [("tokens", 1.0)]
-    panels += [("score", 1.0), ("p_now", 1.0), ("p_future", 1.0)]
+    panels += [("vad", 0.8), ("events", events_h), ("bins", 0.9)]
+    for i in range(len(token_sets)):
+        panels += [(f"tokens{i}", 1.0)]
+    if overlays is None:
+        panels += [("score", 1.0)]           # raw A/B curves (single model)
+    panels += [("p_shift", 1.0), ("p_now", 1.0), ("p_future", 1.0)]
 
     fig, axes = plt.subplots(
         len(panels), 1, sharex=True,
         figsize=(12, 1.05 * sum(h for _, h in panels)),
         gridspec_kw={"height_ratios": [h for _, h in panels], "hspace": 0.12},
     )
+    # Rendered without bbox_inches="tight" (the figure-player overlay needs
+    # stable pixel geometry), so trim the margins here instead.
+    fig.subplots_adjust(left=0.055, right=0.995, top=0.94, bottom=0.07)
     ax_of = dict(zip((n for n, _ in panels), np.atleast_1d(axes)))
 
     if wav is not None:
         _panel_wave(ax_of["wave_a"], wav[0], wav_sr, wav_t0, COL_A, "A (L)")
         _panel_wave(ax_of["wave_b"], wav[1], wav_sr, wav_t0, COL_B, "B (R)")
     _panel_vad(ax_of["vad"], probs["vad"], frame_hz, t0, t1)
-    _panel_events(ax_of["events"], cases_win, case["event_key"], zcfg, frame_hz)
+    _panel_events(ax_of["events"], cases_win, case["event_key"], zcfg, frame_hz,
+                  models=model_names)
     _panel_bins(ax_of["bins"], probs["bin_probs"], case, zcfg, frame_hz,
                 bin_times, t0, t1)
-    if tokens is not None:
-        _panel_tokens(ax_of["tokens"], tokens, frame_hz, t0, t1)
-    _panel_task_score(ax_of["score"], probs, case, frame_hz, t0, t1)
-    ov_now = [(n, p["p_now"]) for n, p in overlays] if overlays else None
-    ov_fut = [(n, p["p_future"]) for n, p in overlays] if overlays else None
-    _panel_prob(ax_of["p_now"], probs["p_now"], frame_hz, t0, t1, "p_now", ov_now)
+    for i, (lbl, tdf) in enumerate(token_sets):
+        ax_t = ax_of[f"tokens{i}"]
+        _panel_tokens(ax_t, tdf, frame_hz, t0, t1)
+        if lbl:
+            col = (MODEL_COLORS[model_names.index(lbl)]
+                   if (model_names and lbl in model_names) else INK)
+            ax_t.text(0.003, 0.84, lbl, transform=ax_t.transAxes, fontsize=8,
+                      color=col, fontweight="bold",
+                      bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
+    if "score" in ax_of:
+        _panel_task_score(ax_of["score"], probs, case, frame_hz, t0, t1)
+    _panel_pshift(ax_of["p_shift"], probs, case, zcfg, frame_hz, t0, t1,
+                  overlays=overlays)
+    ov_now = [(o["name"], o["probs"]["p_now"]) for o in overlays] if overlays else None
+    ov_fut = [(o["name"], o["probs"]["p_future"]) for o in overlays] if overlays else None
+    _panel_prob(ax_of["p_now"], probs["p_now"], frame_hz, t0, t1,
+                "p_now  ↑=A / ↓=B", ov_now)
     _panel_prob(ax_of["p_future"], probs["p_future"], frame_hz, t0, t1,
-                "p_future", ov_fut)
+                "p_future  ↑=A / ↓=B", ov_fut)
 
     labels = {"wave_a": "", "wave_b": "", "vad": "VAD", "events": "S/H",
-              "bins": "bins", "tokens": "tokens", "score": "score",
-              "p_now": "", "p_future": ""}
+              "bins": "bins", "score": "score",
+              "p_shift": "P(SHIFT)", "p_now": "", "p_future": ""}
+    for i in range(len(token_sets)):
+        labels[f"tokens{i}"] = "tokens"
     t_event = case["silence_start"] / frame_hz
     for name, _ in panels:
         ax = ax_of[name]
@@ -290,9 +419,12 @@ def detail_figure(
     ax_of[panels[-1][0]].set_xlabel("time [s]", fontsize=9, color=INK)
 
     ok = "OK" if case["correct"] else "NG"
+    pre = "A" if int(case["pre_speaker"]) == 0 else "B"
+    post = "A" if int(case["post_speaker"]) == 0 else "B"
     fig.suptitle(
         f"{case['session']}  {case['task']}  t={case['t_sec']:.2f}s   "
+        f"pre={pre}→post={post}   "
         f"gold={case['gold']} pred={case['pred']} [{ok}]   "
         f"score={case['score']:.4f} thr={case['threshold']:.4f}",
-        fontsize=10, color=COL_OK if case["correct"] else COL_NG, y=1.0)
+        fontsize=10, color=COL_OK if case["correct"] else COL_NG, y=0.985)
     return fig

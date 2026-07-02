@@ -22,7 +22,7 @@ import streamlit.components.v1 as components
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import bundle as B          # noqa: E402
 from lib import plots as P           # noqa: E402
-from lib.audio_player import audio_player_html   # noqa: E402
+from lib.audio_player import figure_player_html   # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -132,6 +132,10 @@ else:
             joined = joined.merge(keep, on="event_key", how="inner")
     df = joined.reset_index(drop=True)
 
+# unfiltered snapshot: the detail view lists neighbouring events regardless
+# of the sidebar filters (comparison mode keeps per-model columns this way)
+df_unfiltered = df.copy()
+
 meta0 = metas[sel_names[0]]
 
 # -- filters ----------------------------------------------------------------
@@ -237,15 +241,35 @@ if show_audio:
     else:
         wav, wav_sr = B.read_stereo_crop(pl, pr, t0, t1 - t0)
 
-# neighbouring same-task cases in the visible window (single-model detail
-# uses the primary bundle's outcome)
+# neighbouring same-task cases in the visible window. Comparison mode uses
+# the joined table so the events panel can show every model's outcome.
 primary = sel_names[0]
-c_all = full[primary]
-cases_win = c_all[(c_all["task"] == task) & (c_all["session"] == sid)
+if mode == "比較":
+    c_all = df_unfiltered          # already task-filtered, has pred_<m> cols
+else:
+    c_all = full[primary]
+    c_all = c_all[c_all["task"] == task]
+cases_win = c_all[(c_all["session"] == sid)
                   & (c_all["t_sec"] >= t0 - 2) & (c_all["t_sec"] <= t1 + 2)]
 
 probs0 = B.load_probs(dirs[primary], sid)
-tokens = B.load_tokens(dirs[primary], sid) if metas[primary].get("has_tokens") else None
+
+# token sets: comparison mode shows one panel per DISTINCT lang feature set
+# (models sharing the same lang_dir produce identical tokens -> one panel).
+if mode == "比較":
+    _groups: dict[str, list[str]] = {}
+    for n in sel_names:
+        if metas[n].get("has_tokens"):
+            _groups.setdefault(metas[n].get("lang_dir") or n, []).append(n)
+    token_sets = []
+    for names_g in _groups.values():
+        tdf = B.load_tokens(dirs[names_g[0]], sid)
+        if tdf is not None:
+            token_sets.append((", ".join(names_g), tdf))
+else:
+    tdf = (B.load_tokens(dirs[primary], sid)
+           if metas[primary].get("has_tokens") else None)
+    token_sets = [("", tdf)] if tdf is not None else []
 
 case0 = case.to_dict()
 if mode == "比較":
@@ -254,7 +278,14 @@ if mode == "比較":
                  correct=bool(case[f"correct_{primary}"]),
                  threshold=case.get(f"threshold_{primary}", case.get("threshold")),
                  exp=primary)
-    overlays = [(n, B.load_probs(dirs[n], sid)) for n in sel_names]
+    overlays = [
+        {"name": n,
+         "probs": B.load_probs(dirs[n], sid),
+         "threshold": float(case[f"threshold_{n}"]),
+         "pred": case[f"pred_{n}"],
+         "correct": bool(case[f"correct_{n}"])}
+        for n in sel_names
+    ]
 else:
     overlays = None
 
@@ -262,9 +293,15 @@ with left:
     fig = P.detail_figure(
         case=case0, probs=probs0, meta=meta0, cases_win=cases_win,
         t0=t0, t1=t1, wav=wav, wav_sr=wav_sr, wav_t0=t0,
-        tokens=tokens, overlays=overlays,
+        token_sets=token_sets, overlays=overlays,
     )
-    st.pyplot(fig, width="stretch")
+    if wav is not None and wav_sr:
+        # figure + audio in one component: playhead overlaid on the figure,
+        # click anywhere on the figure to seek.
+        html, height = figure_player_html(fig, wav, wav_sr, t0, t1)
+        components.html(html, height=height, scrolling=False)
+    else:
+        st.pyplot(fig, width="stretch")
 
 with right:
     if mode == "比較":
@@ -276,14 +313,15 @@ with right:
                 for n in sel_names]
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if wav is not None and wav_sr:
-        html, height = audio_player_html(wav, wav_sr, t0, marker_sec=t_ev)
-        components.html(html, height=height)
-        st.caption(f"{t0:.1f}s – {t1:.1f}s (上段A/下段B, 点線=イベント時刻)")
-    if tokens is not None:
+        st.caption(f"音声: {t0:.1f}s – {t1:.1f}s (図の下のプレーヤーで再生。"
+                   f"再生位置は図上の赤線、点線=イベント時刻)")
+    if token_sets:
+        st.markdown("**可視トークン**")
         a0, a1 = int(t0 * frame_hz), int(t1 * frame_hz)
-        vis = tokens[(tokens["pos"] < a1) & (tokens["end"] > a0)]
-        if len(vis):
-            st.markdown("**可視トークン**")
+        for lbl, tdf in token_sets:
+            vis = tdf[(tdf["pos"] < a1) & (tdf["end"] > a0)]
+            if lbl:
+                st.caption(f"◆ {lbl}")
             txt = {ch: "".join(str(t) for t in vis[vis["ch"] == ch]["text"])
                    for ch in ("L", "R")}
             st.caption(f"A: {txt.get('L', '')}")
