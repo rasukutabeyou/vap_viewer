@@ -21,6 +21,27 @@ def list_bundles(root: Path) -> list[str]:
     return sorted(d.name for d in root.iterdir() if (d / "meta.json").is_file())
 
 
+def load_aliases(root: Path) -> dict[str, str]:
+    """User-editable display names: {bundle_dir_name: label}.
+
+    Stored next to the bundles (``<root>/aliases.json``) so a rename does not
+    require re-extraction. Missing / broken file = no aliases."""
+    p = root / "aliases.json"
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return {k: str(v).strip() for k, v in raw.items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def save_aliases(root: Path, aliases: dict[str, str]) -> None:
+    (root / "aliases.json").write_text(
+        json.dumps(aliases, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+
+
 @lru_cache(maxsize=64)
 def load_meta(bundle_dir: str) -> dict:
     return json.loads((Path(bundle_dir) / "meta.json").read_text())
