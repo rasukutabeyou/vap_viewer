@@ -1,1 +1,3 @@
 bundles/
+__pycache__/
+.venv/

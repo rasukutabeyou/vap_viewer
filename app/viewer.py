@@ -12,15 +12,19 @@ Two modes:
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 from pathlib import Path
 
 import pandas as pd
+import soundfile as sf
 import streamlit as st
 import streamlit.components.v1 as components
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib import bundle as B          # noqa: E402
+from lib import export as X          # noqa: E402
+from lib import notes as N           # noqa: E402
 from lib import plots as P           # noqa: E402
 from lib.audio_player import figure_player_html   # noqa: E402
 
@@ -36,14 +40,32 @@ def _cli_args():
     p.add_argument("--audio-root", type=Path, default=None,
                    help="root of the shared wav storage (audio is referenced, "
                         "not bundled).")
+    p.add_argument("--notes-file", type=Path, default=None,
+                   help="JSON file for memos/bookmarks "
+                        "(default: <bundles-dir>/notes.json).")
     args, _ = p.parse_known_args()
     return args
 
 
 st.set_page_config(page_title="VAP error-case viewer", layout="wide")
 ARGS = _cli_args()
+NOTES_PATH = ARGS.notes_file or ARGS.bundles_dir / "notes.json"
 
 TASK_LABEL = {"shift_hold": "shift_hold (S/H)", "shift_pred": "shift_pred (見逃し中心)"}
+
+
+# -- memo / bookmark callbacks (run BEFORE the script reruns, so the list
+#    already shows the updated note when the page redraws) ------------------
+
+def _save_memo(event_key: str, ctx: dict) -> None:
+    N.update_note(NOTES_PATH, event_key,
+                  memo=st.session_state.get(f"memo_{event_key}", ""),
+                  context=ctx)
+
+def _save_bookmark(event_key: str, ctx: dict) -> None:
+    N.update_note(NOTES_PATH, event_key,
+                  bookmark=st.session_state.get(f"bm_{event_key}", False),
+                  context=ctx)
 
 
 @st.cache_data(show_spinner=False)
@@ -139,7 +161,12 @@ df_unfiltered = df.copy()
 meta0 = metas[sel_names[0]]
 
 # -- filters ----------------------------------------------------------------
+notes = N.load_notes(NOTES_PATH)   # {event_key: {"memo","bookmark",...}}
+
 st.sidebar.subheader("フィルタ")
+if st.sidebar.checkbox("★ ブックマークのみ", value=False):
+    marked = {k for k, v in notes.items() if v.get("bookmark")}
+    df = df[df["event_key"].isin(marked)]
 sessions = sorted(df["session"].unique())
 sel_sessions = st.sidebar.multiselect("セッション (空=全て)", sessions)
 if sel_sessions:
@@ -202,20 +229,33 @@ for i, n in enumerate(sel_names):
     cols[2 + i].metric(f"{n} 正解率", f"{acc:.3f}",
                        help=f"{task} 全{len(t_all)}件での正解率")
 
-show_cols = [c for c in df.columns
-             if c not in ("task", "exp", "silence_start", "silence_end")]
+df = df.assign(
+    **{"★": df["event_key"].map(lambda k: "⭐" if notes.get(k, {}).get("bookmark") else ""),
+       "メモ": df["event_key"].map(lambda k: notes.get(k, {}).get("memo", ""))})
+show_cols = ["★", "メモ"] + [c for c in df.columns
+                             if c not in ("task", "exp", "silence_start",
+                                          "silence_end", "★", "メモ")]
 event = st.dataframe(
     df[show_cols],
-    height=380, width="stretch", hide_index=True,
+    height=380, width="stretch", hide_index=True, key="case_table",
     on_select="rerun", selection_mode="single-row",
+    column_config={"★": st.column_config.TextColumn("★", width="small"),
+                   "メモ": st.column_config.TextColumn("メモ", width="medium")},
 )
 
+# Selecting a row shows the detail view. Saving a memo/bookmark rewrites the
+# table data, which can drop the dataframe selection -- fall back to the last
+# selected event so the detail view survives the save.
 sel_rows = event.selection.rows if event and event.selection else []
-if not sel_rows:
-    st.caption("↑ 行をクリックすると詳細を表示します。")
-    st.stop()
-
-case = df.iloc[sel_rows[0]]
+if sel_rows and sel_rows[0] < len(df):
+    case = df.iloc[sel_rows[0]]
+    st.session_state["last_event_key"] = case["event_key"]
+else:
+    hit = df.index[df["event_key"] == st.session_state.get("last_event_key")]
+    if len(hit) == 0:
+        st.caption("↑ 行をクリックすると詳細を表示します。")
+        st.stop()
+    case = df.loc[hit[0]]
 sid = case["session"]
 
 # --------------------------------------------------------------------------
@@ -227,6 +267,19 @@ left, right = st.columns([3, 1])
 with right:
     margin_sec = st.slider("表示幅 (イベント前後, 秒)", 2.0, 20.0, 6.0, 0.5)
     show_audio = st.checkbox("音声", value=True)
+
+    # -- memo / bookmark (persisted to NOTES_PATH, shared across modes) ----
+    ek = case["event_key"]
+    note = notes.get(ek, {})
+    note_ctx = {"session": sid, "task": task, "t_sec": float(case["t_sec"])}
+    st.toggle("★ ブックマーク", value=bool(note.get("bookmark")),
+              key=f"bm_{ek}", on_change=_save_bookmark, args=(ek, note_ctx))
+    st.text_area("メモ", value=note.get("memo", ""), key=f"memo_{ek}",
+                 height=110, placeholder="このケースの特徴・気づきを記録")
+    st.button("メモを保存", key=f"savememo_{ek}",
+              on_click=_save_memo, args=(ek, note_ctx), width="stretch")
+    if note.get("updated"):
+        st.caption(f"最終更新: {note['updated']}")
 
 frame_hz = float(meta0["frame_hz"])
 t_ev = float(case["t_sec"])
@@ -289,6 +342,15 @@ if mode == "比較":
 else:
     overlays = None
 
+model_rows = None
+if mode == "比較":
+    model_rows = [{"model": n,
+                   "pred": case[f"pred_{n}"],
+                   "score": f"{case[f'score_{n}']:.4f}",
+                   "正誤": "OK" if case[f"correct_{n}"] else "NG"}
+                  for n in sel_names]
+
+player_html = ""
 with left:
     fig = P.detail_figure(
         case=case0, probs=probs0, meta=meta0, cases_win=cases_win,
@@ -298,20 +360,15 @@ with left:
     if wav is not None and wav_sr:
         # figure + audio in one component: playhead overlaid on the figure,
         # click anywhere on the figure to seek.
-        html, height = figure_player_html(fig, wav, wav_sr, t0, t1)
-        components.html(html, height=height, scrolling=False)
+        player_html, height = figure_player_html(fig, wav, wav_sr, t0, t1)
+        components.html(player_html, height=height, scrolling=False)
     else:
         st.pyplot(fig, width="stretch")
 
 with right:
     if mode == "比較":
         st.markdown("**モデル別判定**")
-        rows = [{"model": n,
-                 "pred": case[f"pred_{n}"],
-                 "score": f"{case[f'score_{n}']:.4f}",
-                 "正誤": "OK" if case[f"correct_{n}"] else "NG"}
-                for n in sel_names]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.dataframe(pd.DataFrame(model_rows), hide_index=True, width="stretch")
     if wav is not None and wav_sr:
         st.caption(f"音声: {t0:.1f}s – {t1:.1f}s (図の下のプレーヤーで再生。"
                    f"再生位置は図上の赤線、点線=イベント時刻)")
@@ -326,3 +383,40 @@ with right:
                    for ch in ("L", "R")}
             st.caption(f"A: {txt.get('L', '')}")
             st.caption(f"B: {txt.get('R', '')}")
+
+    # -- export (for reports: a screenshot cannot play audio, the HTML can) --
+    st.markdown("**保存 (レポート用)**")
+    fname = X.safe_filename("case", sid, f"{t_ev:.1f}s", task)
+    info_rows = [("バンドル", ", ".join(sel_names)),
+                 ("セッション", sid),
+                 ("タスク", task),
+                 ("イベント時刻", f"{t_ev:.2f} s"),
+                 ("gold", case["gold"]),
+                 ("表示範囲", f"{t0:.1f} – {t1:.1f} s")]
+    if mode == "単一モデル":
+        info_rows += [("pred", case["pred"]),
+                      ("score", f"{float(case['score']):.4f}"),
+                      ("threshold", f"{float(case['threshold']):.4f}"),
+                      ("正誤", "OK" if case["correct"] else "NG")]
+    if player_html:
+        doc = X.standalone_case_html(
+            title=f"VAPケース {sid} @ {t_ev:.2f}s ({task})",
+            info_rows=info_rows,
+            memo=st.session_state.get(f"memo_{ek}", note.get("memo", "")),
+            player_fragment=player_html,
+            models=model_rows,
+        )
+        st.download_button("📄 HTML (図+音声, 単体で再生可)", data=doc,
+                           file_name=f"{fname}.html", mime="text/html",
+                           width="stretch")
+    else:
+        st.caption("音声付きHTMLは音声表示ON時のみ保存できます。")
+    st.download_button("🖼 PNG (図のみ)", data=X.figure_png_bytes(fig),
+                       file_name=f"{fname}.png", mime="image/png",
+                       width="stretch")
+    if wav is not None and wav_sr:
+        _wb = io.BytesIO()
+        sf.write(_wb, wav.T, wav_sr, format="WAV", subtype="PCM_16")
+        st.download_button("🔊 WAV (音声のみ)", data=_wb.getvalue(),
+                           file_name=f"{fname}.wav", mime="audio/wav",
+                           width="stretch")
