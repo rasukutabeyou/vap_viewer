@@ -193,21 +193,78 @@ def _panel_bins(ax, bin_probs, case, zcfg, frame_hz, bin_times, t0, t1):
     ax.set_yticklabels(["A", "B"], fontsize=8)
 
 
+_OPEN_END = 2 ** 30      # lang npz sentinel: never expired / never finalized
+
+
 def _panel_tokens(ax, tokens, frame_hz, t0, t1):
+    """Streaming-ASR tokens, one lane per speaker (A top / B bottom).
+
+    ▎tick = the frame the token became valid model input (``pos``; the
+    cross-attention sees ``pos <= t < end``). Tokens with a finite ``end``
+    also get a line for the span they stayed input before that revision;
+    the ones never finalized (= retracted partials) are gray. Text is
+    horizontal and laid out greedily over a few sub-rows so same-event
+    tokens (identical ``pos``) don't overlap; text that had to shift right
+    keeps a dotted link back to its tick."""
     ax.set_ylim(0, 1)
-    ax.set_yticks([0.72, 0.24])
+    ax.set_yticks([0.75, 0.25])
     ax.set_yticklabels(["A", "B"], fontsize=8)
+    ax.axhline(0.5, color=GRID, lw=0.8)
     a0, a1 = int(t0 * frame_hz), int(t1 * frame_hz)
-    vis = tokens[(tokens["pos"] < a1) & (tokens["end"] > a0)]
-    for _, r in vis.iterrows():
-        y = 0.72 if r["ch"] == "L" else 0.24
-        col = COL_A if r["ch"] == "L" else COL_B
-        x0, x1 = r["pos"] / frame_hz, min(r["end"], a1) / frame_hz
-        ax.plot([x0, x1], [y - 0.1, y - 0.1], color=col, lw=2,
-                alpha=0.4, solid_capstyle="butt")
-        if t0 <= x0 <= t1:
-            ax.text(x0, y, str(r["text"]), fontsize=8, color=INK,
-                    ha="left", va="center", rotation=30, clip_on=True)
+    # Only tokens that BECAME model input inside the window. Filtering on
+    # ``end > a0`` instead would pull in every still-valid token since
+    # session start (end carries the 2^30 open sentinel) -- thousands of
+    # rows that just smear the panel.
+    vis = tokens[(tokens["pos"] >= a0) & (tokens["pos"] < a1)]
+    has_fin = "fin" in tokens.columns
+
+    # estimate rendered text width in data units (no renderer yet):
+    # CJK ~1 em, latin ~0.55 em at font size ``fs``.
+    fs = 7.0
+    ax_w_in = ax.figure.get_size_inches()[0] * ax.get_position().width
+    sec_per_pt = (t1 - t0) / (ax_w_in * 72.0)
+    pad = 1.5 * sec_per_pt
+
+    def est_w(s: str) -> float:
+        return sum(0.55 if ord(c) < 0x2E80 else 1.0 for c in s) * fs * sec_per_pt
+
+    nrows = 3
+    rh = 0.47 / nrows
+    for ch, lane_top, col in (("L", 0.99, COL_A), ("R", 0.49, COL_B)):
+        cursors = [-1e18] * nrows            # rightmost occupied x per sub-row
+        sub = vis[vis["ch"] == ch].sort_values("pos", kind="stable")
+        for _, r in sub.iterrows():
+            x0 = r["pos"] / frame_hz
+            xe = min(int(r["end"]), a1) / frame_hz
+            fin = int(r["fin"]) if has_fin else _OPEN_END
+            retracted = int(r["end"]) < _OPEN_END and fin >= _OPEN_END
+            c = MUTED if retracted else col
+            row = next((i for i in range(nrows) if cursors[i] <= x0), None)
+            if row is None:                  # everything occupied: least-bad row
+                row = min(range(nrows), key=cursors.__getitem__)
+            tx = max(x0, cursors[row], t0)
+            y = lane_top - (row + 0.5) * rh
+            yb = y - 0.42 * rh
+            if int(r["end"]) < _OPEN_END:
+                # finite span = kept as input only until this revision point;
+                # open-ended tokens get no span line (it would just run to
+                # the window edge for every committed token).
+                ax.plot([x0, xe], [yb, yb], color=c, lw=1.6, alpha=0.35,
+                        solid_capstyle="butt", zorder=2)
+            ax.plot([x0, x0], [yb, y + 0.42 * rh], color=c, lw=1.4,
+                    alpha=0.9, zorder=3)     # tick: became model input here
+            link_from = xe if int(r["end"]) < _OPEN_END else x0
+            if tx > x0 and tx + pad > link_from:   # text shifted right: keep linked
+                ax.plot([link_from, tx + pad], [yb, yb], color=c, lw=0.6,
+                        ls=":", alpha=0.5, zorder=2)
+            ax.text(tx + pad, y, str(r["text"]), fontsize=fs,
+                    color=MUTED if retracted else INK,
+                    ha="left", va="center", clip_on=True, zorder=4)
+            cursors[row] = tx + est_w(str(r["text"])) + 3 * pad
+    # legend in the inter-panel gap (transAxes text is not clipped)
+    ax.text(1.0, 1.02, "▎=モデル入力に有効化  ─=撤回までの有効期間  灰=撤回されたpartial",
+            transform=ax.transAxes, fontsize=6, color=INK,
+            ha="right", va="bottom", zorder=5)
 
 
 def _panel_task_score(ax, probs, case, frame_hz, t0, t1):
@@ -363,7 +420,7 @@ def detail_figure(
         panels += [("wave_a", 1.4), ("wave_b", 1.4)]
     panels += [("vad", 0.8), ("events", events_h), ("bins", 0.9)]
     for i in range(len(token_sets)):
-        panels += [(f"tokens{i}", 1.0)]
+        panels += [(f"tokens{i}", 1.35)]     # 2 lanes x 3 text sub-rows
     if overlays is None:
         panels += [("score", 1.0)]           # raw A/B curves (single model)
     panels += [("p_shift", 1.0), ("p_now", 1.0), ("p_future", 1.0)]

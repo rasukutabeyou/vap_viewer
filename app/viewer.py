@@ -53,6 +53,18 @@ NOTES_PATH = ARGS.notes_file or ARGS.bundles_dir / "notes.json"
 
 TASK_LABEL = {"shift_hold": "shift_hold (S/H)", "shift_pred": "shift_pred (見逃し中心)"}
 
+# (gold, pred) -> 判定タイプフィルタの表示ラベル。データに現れた組だけ選択肢に出す
+OUTCOME_LABEL = {
+    ("S", "H"): "S→H: SHIFTをHOLDと誤り (見逃し)",
+    ("H", "S"): "H→S: HOLDをSHIFTと誤り (早とちり)",
+    ("S", "S"): "S→S: 正解",
+    ("H", "H"): "H→H: 正解",
+    ("pos", "neg"): "pos→neg: SHIFT予測の見逃し (FN)",
+    ("pos", "pos"): "pos→pos: 正解 (TP)",
+    ("neg", "pos"): "neg→pos: 誤検出 (FP)",
+    ("neg", "neg"): "neg→neg: 正解 (TN)",
+}
+
 
 # -- memo / bookmark callbacks (run BEFORE the script reruns, so the list
 #    already shows the updated note when the page redraws) ------------------
@@ -214,23 +226,27 @@ if sel_sessions:
     df = df[df["session"].isin(sel_sessions)]
 
 if mode == "単一モデル":
-    only_ng = st.sidebar.checkbox("NGのみ", value=True)
-    if only_ng:
-        df = df[~df["correct"]]
-    gold_vals = sorted(df["gold"].unique())
-    sel_gold = st.sidebar.multiselect("gold (空=全て)", gold_vals)
-    if sel_gold:
-        df = df[df["gold"].isin(sel_gold)]
-    pred_vals = sorted(df["pred"].unique())
-    sel_pred = st.sidebar.multiselect("pred (空=全て)", pred_vals)
-    if sel_pred:
-        df = df[df["pred"].isin(sel_pred)]
+    # combos from the unfiltered task table so options stay stable while
+    # other filters narrow df down
+    combos = sorted(set(zip(df_unfiltered["gold"], df_unfiltered["pred"])),
+                    key=lambda c: (c[0] == c[1], c))     # 誤り系を先頭に
+    opts = {OUTCOME_LABEL.get(c, f"{c[0]}→{c[1]}"): c for c in combos}
+    ng_default = [lbl for lbl, (g, p) in opts.items() if g != p]
+    sel_out = st.sidebar.multiselect("判定タイプ gold→pred (空=全て)",
+                                     list(opts), default=ng_default)
+    if sel_out:
+        keep = {opts[lbl] for lbl in sel_out}
+        df = df[[gp in keep for gp in zip(df["gold"], df["pred"])]]
     if len(df):
         lo, hi = float(df["score"].min()), float(df["score"].max())
         if lo < hi:
             r = st.sidebar.slider("スコア範囲", lo, hi, (lo, hi))
             df = df[(df["score"] >= r[0]) & (df["score"] <= r[1])]
 else:
+    gold_vals = sorted(df["gold"].unique())
+    sel_gold = st.sidebar.multiselect("gold (空=全て)", gold_vals)
+    if sel_gold:
+        df = df[df["gold"].isin(sel_gold)]
     only_ng_of = {f"{LABEL[n]} のみNG": n for n in sel_names}
     patterns = ["すべて", "いずれかNG", "全モデルNG"] + list(only_ng_of)
     pat = st.sidebar.selectbox("正誤パターン", patterns, index=1)
@@ -418,17 +434,28 @@ with right:
     if wav is not None and wav_sr:
         st.caption(f"音声: {t0:.1f}s – {t1:.1f}s (図の下のプレーヤーで再生。"
                    f"再生位置は図上の赤線、点線=イベント時刻)")
+    # event-time snapshot per token set: tokens that became input inside the
+    # visible window (end==2^30 = open sentinel, so an end-only filter would
+    # return the whole session) and were still valid at the event frame.
+    # Shown here and embedded in the HTML export below.
+    token_snapshots = []
     if token_sets:
-        st.markdown("**可視トークン**")
-        a0, a1 = int(t0 * frame_hz), int(t1 * frame_hz)
+        ev_frame = int(case["silence_start"])
+        a0 = int(t0 * frame_hz)
         for lbl, tdf in token_sets:
-            vis = tdf[(tdf["pos"] < a1) & (tdf["end"] > a0)]
+            act = tdf[(tdf["pos"] >= a0) & (tdf["pos"] <= ev_frame)
+                      & (tdf["end"] > ev_frame)]
+            txt = {ch: "".join(str(t) for t in act[act["ch"] == ch]["text"])
+                   for ch in ("L", "R")}
+            token_snapshots.append((lbl, txt))
+        st.markdown("**イベント時点の有効トークン**")
+        for lbl, txt in token_snapshots:
             if lbl:
                 st.caption(f"◆ {lbl}")
-            txt = {ch: "".join(str(t) for t in vis[vis["ch"] == ch]["text"])
-                   for ch in ("L", "R")}
             st.caption(f"A: {txt.get('L', '')}")
             st.caption(f"B: {txt.get('R', '')}")
+        st.caption("表示窓内で入力に加わり、無音開始フレーム(図の点線)の時点で"
+                   "まだ有効だったトークン列。撤回済みの仮説は含みません。")
 
     # -- export (for reports: a screenshot cannot play audio, the HTML can) --
     st.markdown("**保存 (レポート用)**")
@@ -453,6 +480,7 @@ with right:
             memo=st.session_state.get(f"memo_{ek}", note.get("memo", "")),
             player_fragment=player_html,
             models=model_rows,
+            token_snapshots=token_snapshots,
         )
         st.download_button("📄 HTML (図+音声, 単体で再生可)", data=doc,
                            file_name=f"{fname}.html", mime="text/html",

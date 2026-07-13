@@ -50,6 +50,25 @@ def _models_table(models: list[dict]) -> str:
             f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
 
 
+def _tokens_section(snapshots: list[tuple[str, dict]] | None) -> str:
+    """snapshots: [(label, {"L": text, "R": text}), ...] -- the tokens that
+    were valid model input at the event frame (same set as the viewer's
+    right-pane 「イベント時点の有効トークン」)."""
+    if not snapshots:
+        return ""
+    parts = ["<h2>イベント時点の有効トークン</h2>"]
+    for lbl, txt in snapshots:
+        if lbl:
+            parts.append(f"<div class='tklabel'>◆ {html.escape(lbl)}</div>")
+        parts.append("<div class='tokens'>"
+                     f"A: {html.escape(txt.get('L', ''))}<br>"
+                     f"B: {html.escape(txt.get('R', ''))}</div>")
+    parts.append("<div class='note'>表示窓内で入力に加わり、無音開始フレーム"
+                 "(図の点線)の時点でまだ有効だったトークン列。"
+                 "撤回済みの仮説は含みません。</div>")
+    return "".join(parts)
+
+
 def standalone_case_html(
     *,
     title: str,
@@ -57,6 +76,7 @@ def standalone_case_html(
     memo: str = "",
     player_fragment: str = "",
     models: list[dict] | None = None,
+    token_snapshots: list[tuple[str, dict]] | None = None,
 ) -> str:
     """Full HTML document: header facts + memo + figure/audio player."""
     memo_html = ""
@@ -81,6 +101,11 @@ def standalone_case_html(
   table.models thead th {{ background: #f4f3f1; }}
   .memo {{ white-space: pre-wrap; border-left: 3px solid #ccc;
            padding: 6px 10px; font-size: 13px; background: #fafaf8; }}
+  .tklabel {{ font-size: 12px; font-weight: bold; margin-top: 6px; }}
+  .tokens {{ font-size: 13px; border-left: 3px solid #ccc;
+             padding: 4px 10px; margin: 4px 0; background: #fafaf8;
+             overflow-wrap: anywhere; }}
+  .note {{ font-size: 11px; color: #999; }}
   .stamp {{ font-size: 11px; color: #999; margin-top: 20px; }}
 </style>
 </head>
@@ -88,6 +113,7 @@ def standalone_case_html(
 <h1>{html.escape(title)}</h1>
 {_info_table(info_rows)}
 {_models_table(models or [])}
+{_tokens_section(token_snapshots)}
 {memo_html}
 <h2>詳細図{"・音声" if player_fragment else ""}</h2>
 {player_fragment}
