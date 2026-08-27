@@ -21,7 +21,7 @@ vapx の zero-shot 評価(SHIFT/HOLD・SHIFT予測)の**誤りケースを横断
 cd ~/work/vapx
 uv run --with pandas --with pyarrow python ~/work/vap_viewer/build/extract_error_cases.py \
     --recipe-dir egs/tabidachi/vap1 \
-    --exp-dir exp/train_audio_cpc_reg \
+    --exp-dir exp/main/audio_cpc \
     --split test \
     --out ~/work/vap_viewer/bundles/audio_cpc_reg
 ```

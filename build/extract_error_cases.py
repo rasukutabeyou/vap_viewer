@@ -26,7 +26,7 @@ pyarrow are added ephemerally without touching the lockfile):
   cd ~/work/vapx
   uv run --with pandas --with pyarrow python ~/work/vap_viewer/build/extract_error_cases.py \
       --recipe-dir egs/tabidachi/vap1 \
-      --exp-dir exp/train_lang_kv_sarashina_reg \
+      --exp-dir exp/sub/old_sarashina_reg \
       --split test \
       --out ~/work/vap_viewer/bundles/lang_kv_sarashina_reg
 """

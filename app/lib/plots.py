@@ -267,6 +267,15 @@ def _panel_tokens(ax, tokens, frame_hz, t0, t1):
             ha="right", va="bottom", zorder=5)
 
 
+def _score_dot(ax, x, score, color):
+    """The case score (eval-window mean) as a dot at the silence start.
+    Above/below the dashed threshold line = pos/neg at a glance."""
+    if score is None or score != score:      # None / NaN
+        return
+    ax.plot([x], [score], marker="o", ms=7, mfc=color, mec="white",
+            mew=1.2, zorder=6, clip_on=False)
+
+
 def _panel_task_score(ax, probs, case, frame_hz, t0, t1):
     a, b = int(max(0, t0 * frame_hz)), int(t1 * frame_hz) + 1
     t = np.arange(a, min(b, len(probs["score_sh"]))) / frame_hz
@@ -278,6 +287,8 @@ def _panel_task_score(ax, probs, case, frame_hz, t0, t1):
     if case["task"] == "shift_pred" and thr == thr:   # not NaN
         ax.axhline(thr, color=INK, lw=1, ls="--")
         ax.text(t1, thr, f" thr={thr:.3f}", fontsize=7, color=INK, va="bottom", ha="right")
+        _score_dot(ax, case["silence_start"] / frame_hz, case.get("score"),
+                   COL_OK if case.get("correct") else COL_NG)
     ax.set_ylim(-0.02, max(0.5, float(curves.max()) * 1.15) if len(curves) else 1)
     ax.legend(loc="upper right", fontsize=7, frameon=False, ncol=2)
 
@@ -303,6 +314,7 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
     ax.axvspan(ws, we, color=MUTED, alpha=0.18, lw=0)
 
     is_sh = case["task"] == "shift_hold"
+    t_event = case["silence_start"] / frame_hz
     ymax = 0.25
     if overlays:
         for i, (ov, col) in enumerate(zip(overlays, MODEL_COLORS)):
@@ -313,6 +325,7 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
             thr = ov.get("threshold")
             if thr is not None and thr == thr:
                 ax.axhline(thr, color=col, lw=1, ls="--", alpha=0.8)
+            _score_dot(ax, t_event, ov.get("score"), col)
             if len(y):
                 ymax = max(ymax, float(y.max()))
             if is_sh:
@@ -333,6 +346,8 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
             ax.axhline(thr, color=INK, lw=1, ls="--", alpha=0.8)
             ax.text(t1, thr, f" thr={thr:.3f}", fontsize=7, color=INK,
                     va="bottom", ha="right")
+        _score_dot(ax, t_event, case.get("score"),
+                   COL_OK if case.get("correct") else COL_NG)
         if len(y):
             ymax = max(ymax, float(y.max()))
 

@@ -398,6 +398,7 @@ if mode == "比較":
          "probs": B.load_probs(dirs[n], sid),
          "threshold": float(case[f"threshold_{n}"]),
          "pred": case[f"pred_{n}"],
+         "score": float(case[f"score_{n}"]),
          "correct": bool(case[f"correct_{n}"])}
         for n in sel_names
     ]
