@@ -392,6 +392,17 @@ def _panel_prob(ax, curve, frame_hz, t0, t1, label, overlays=None):
 # --------------------------------------------------------------------------
 
 
+def _panel_unit(name: str) -> str:
+    """内部パネル名 -> 表示トグルの単位。
+
+    wave_a/wave_b は "wave"、tokens0.. は "tokens" でまとめて出し入れする。"""
+    if name.startswith("wave"):
+        return "wave"
+    if name.startswith("tokens"):
+        return "tokens"
+    return name
+
+
 def detail_figure(
     *,
     case: dict,
@@ -406,6 +417,7 @@ def detail_figure(
     tokens=None,
     token_sets: list[tuple[str, object]] | None = None,
     overlays: list[dict] | None = None,
+    visible: set[str] | None = None,
 ):
     """One figure, panels top to bottom (only those with data):
     wave A / wave B / VAD / events / bin heatmap / tokens (one panel per
@@ -418,7 +430,13 @@ def detail_figure(
     is the single-model shorthand.
 
     ``overlays`` (comparison mode): ``[{name, probs, threshold, pred,
-    correct}, ...]`` -- one entry per model, first entry = primary bundle."""
+    correct}, ...]`` -- one entry per model, first entry = primary bundle.
+
+    ``visible``: 表示するパネル単位の集合 (``wave`` / ``vad`` / ``events`` /
+    ``bins`` / ``tokens`` / ``score`` / ``p_shift`` / ``p_now`` /
+    ``p_future``)。None = 従来どおり全部。データの無いパネルは指定に関わらず
+    出ない。全部OFFのときは ``plt.subplots(0, 1)`` が作れず図プレーヤーの
+    時刻→ピクセル対応にも軸が1つ要るので、``vad`` を1枚だけ残す。"""
     if token_sets is None and tokens is not None:
         token_sets = [("", tokens)]
     token_sets = [(lbl, t) for lbl, t in (token_sets or []) if t is not None]
@@ -439,6 +457,10 @@ def detail_figure(
     if overlays is None:
         panels += [("score", 1.0)]           # raw A/B curves (single model)
     panels += [("p_shift", 1.0), ("p_now", 1.0), ("p_future", 1.0)]
+    if visible is not None:
+        panels = [(n, h) for n, h in panels if _panel_unit(n) in visible]
+        if not panels:                       # 全部OFF: 軸ゼロの図は作れない
+            panels = [("vad", 0.8)]
 
     fig, axes = plt.subplots(
         len(panels), 1, sharex=True,
@@ -450,16 +472,21 @@ def detail_figure(
     fig.subplots_adjust(left=0.055, right=0.995, top=0.94, bottom=0.07)
     ax_of = dict(zip((n for n, _ in panels), np.atleast_1d(axes)))
 
-    if wav is not None:
+    if "wave_a" in ax_of:
         _panel_wave(ax_of["wave_a"], wav[0], wav_sr, wav_t0, COL_A, "A (L)")
         _panel_wave(ax_of["wave_b"], wav[1], wav_sr, wav_t0, COL_B, "B (R)")
-    _panel_vad(ax_of["vad"], probs["vad"], frame_hz, t0, t1)
-    _panel_events(ax_of["events"], cases_win, case["event_key"], zcfg, frame_hz,
-                  models=model_names)
-    _panel_bins(ax_of["bins"], probs["bin_probs"], case, zcfg, frame_hz,
-                bin_times, t0, t1)
+    if "vad" in ax_of:
+        _panel_vad(ax_of["vad"], probs["vad"], frame_hz, t0, t1)
+    if "events" in ax_of:
+        _panel_events(ax_of["events"], cases_win, case["event_key"], zcfg,
+                      frame_hz, models=model_names)
+    if "bins" in ax_of:
+        _panel_bins(ax_of["bins"], probs["bin_probs"], case, zcfg, frame_hz,
+                    bin_times, t0, t1)
     for i, (lbl, tdf) in enumerate(token_sets):
-        ax_t = ax_of[f"tokens{i}"]
+        ax_t = ax_of.get(f"tokens{i}")
+        if ax_t is None:                     # tokens パネルは非表示
+            continue
         _panel_tokens(ax_t, tdf, frame_hz, t0, t1)
         if lbl:
             col = (MODEL_COLORS[model_names.index(lbl)]
@@ -469,14 +496,20 @@ def detail_figure(
                       bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
     if "score" in ax_of:
         _panel_task_score(ax_of["score"], probs, case, frame_hz, t0, t1)
-    _panel_pshift(ax_of["p_shift"], probs, case, zcfg, frame_hz, t0, t1,
-                  overlays=overlays)
-    ov_now = [(o["name"], o["probs"]["p_now"]) for o in overlays] if overlays else None
-    ov_fut = [(o["name"], o["probs"]["p_future"]) for o in overlays] if overlays else None
-    _panel_prob(ax_of["p_now"], probs["p_now"], frame_hz, t0, t1,
-                "p_now  ↑=A / ↓=B", ov_now)
-    _panel_prob(ax_of["p_future"], probs["p_future"], frame_hz, t0, t1,
-                "p_future  ↑=A / ↓=B", ov_fut)
+    if "p_shift" in ax_of:
+        _panel_pshift(ax_of["p_shift"], probs, case, zcfg, frame_hz, t0, t1,
+                      overlays=overlays)
+    # overlay の列作りは該当パネルが出るときだけ
+    if "p_now" in ax_of:
+        ov_now = ([(o["name"], o["probs"]["p_now"]) for o in overlays]
+                  if overlays else None)
+        _panel_prob(ax_of["p_now"], probs["p_now"], frame_hz, t0, t1,
+                    "p_now  ↑=A / ↓=B", ov_now)
+    if "p_future" in ax_of:
+        ov_fut = ([(o["name"], o["probs"]["p_future"]) for o in overlays]
+                  if overlays else None)
+        _panel_prob(ax_of["p_future"], probs["p_future"], frame_hz, t0, t1,
+                    "p_future  ↑=A / ↓=B", ov_fut)
 
     labels = {"wave_a": "", "wave_b": "", "vad": "VAD", "events": "S/H",
               "bins": "bins", "score": "score",

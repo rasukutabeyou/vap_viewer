@@ -40,16 +40,16 @@ def _cli_args():
     p.add_argument("--audio-root", type=Path, default=None,
                    help="root of the shared wav storage (audio is referenced, "
                         "not bundled).")
-    p.add_argument("--notes-file", type=Path, default=None,
-                   help="JSON file for memos/bookmarks "
-                        "(default: <bundles-dir>/notes.json).")
+    p.add_argument("--notes-dir", type=Path, default=None,
+                   help="directory holding the per-bundle-combination "
+                        "memo/bookmark JSONs (default: <bundles-dir>/notes).")
     args, _ = p.parse_known_args()
     return args
 
 
 st.set_page_config(page_title="VAP error-case viewer", layout="wide")
 ARGS = _cli_args()
-NOTES_PATH = ARGS.notes_file or ARGS.bundles_dir / "notes.json"
+NOTES_DIR = ARGS.notes_dir or ARGS.bundles_dir / "notes"
 
 TASK_LABEL = {"shift_hold": "shift_hold (S/H)", "shift_pred": "shift_pred (見逃し中心)"}
 
@@ -65,19 +65,39 @@ OUTCOME_LABEL = {
     ("neg", "neg"): "neg→neg: 正解 (TN)",
 }
 
+# 詳細図のパネル表示トグル: (単位キー, ラベル, 既定)。p_now/p_future は
+# 優先度が低いので既定OFF。キーは固定なのでモード/バンドルを切り替えても残る
+PANEL_TOGGLES = [
+    ("wave", "波形 A/B", True),
+    ("vad", "VAD", True),
+    ("events", "S/Hイベント", True),
+    ("bins", "binヒートマップ", True),
+    ("tokens", "トークン (lang系)", True),
+    ("score", "score曲線 (単一モデル)", True),
+    ("p_shift", "P(SHIFT)", True),
+    ("p_now", "p_now", False),
+    ("p_future", "p_future", False),
+]
+
+# 比較モードの正誤フィルタ。プリセット(既定=いずれかNG)と、モデル毎の3択
+# (先頭 = 既定 = 絞り込まない)。3択なら 3^N 通り全部表せる
+OKNG_PATTERNS = ["すべて", "いずれかNG", "全モデルNG", "モデル別指定"]
+OKNG_CHOICES = ["指定なし", "正解のみ", "誤りのみ"]
+
 
 # -- memo / bookmark callbacks (run BEFORE the script reruns, so the list
-#    already shows the updated note when the page redraws) ------------------
+#    already shows the updated note when the page redraws). 保存先はいま選んで
+#    いるバンドル組み合わせのファイル -- ウィジェット生成時に args で束ねる --
 
-def _save_memo(event_key: str, ctx: dict) -> None:
-    N.update_note(NOTES_PATH, event_key,
-                  memo=st.session_state.get(f"memo_{event_key}", ""),
-                  context=ctx)
+def _save_memo(wkey: str, event_key: str, ctx: dict, path: Path,
+               bundles: list[str]) -> None:
+    N.update_note(path, event_key, memo=st.session_state.get(wkey, ""),
+                  context=ctx, bundles=bundles)
 
-def _save_bookmark(event_key: str, ctx: dict) -> None:
-    N.update_note(NOTES_PATH, event_key,
-                  bookmark=st.session_state.get(f"bm_{event_key}", False),
-                  context=ctx)
+def _save_bookmark(wkey: str, event_key: str, ctx: dict, path: Path,
+                   bundles: list[str]) -> None:
+    N.update_note(path, event_key, bookmark=st.session_state.get(wkey, False),
+                  context=ctx, bundles=bundles)
 
 
 @st.cache_data(show_spinner=False)
@@ -102,6 +122,25 @@ if not names:
     st.stop()
 
 mode = st.sidebar.radio("モード", ["単一モデル", "比較"], horizontal=True)
+
+# 表示パネルのトグルは下の st.stop()(比較モードでバンドル1つ以下)より後に
+# 描かれる。描かれない run では streamlit がキーを掃除してしまうので、
+# stop を跨いでも設定が残るよう毎 run ここで書き戻す(無条件の代入が延命になる)。
+# 既定値もここで入れて checkbox には value= を渡さない -- value= と
+# session_state の併用は streamlit がスタック付きの警告をログに吐くため
+for _k, _, _dflt in PANEL_TOGGLES:
+    _pk = f"panel_{_k}"
+    st.session_state[_pk] = st.session_state.get(_pk, _dflt)
+
+# モデル別正誤フィルタも同じ理由で延命する。描かれるのは「モデル別指定」を
+# 選んでいる run のバンドルの分だけなので、これが無いとプリセットを一度見て
+# 戻す/バンドルを外して戻すだけで 3モデル分の指定が消える。radio は index=0 が
+# 既定なので default_value=None 扱いになり、警告ログは出ない
+st.session_state["okng_pattern"] = st.session_state.get("okng_pattern",
+                                                        OKNG_PATTERNS[1])
+for _n in names:
+    _ok = f"okng_{_n}"
+    st.session_state[_ok] = st.session_state.get(_ok, OKNG_CHOICES[0])
 
 
 # -- display names: alias (bundles/aliases.json) > meta.json の exp (--name
@@ -168,8 +207,23 @@ with st.sidebar.expander("表示名の編集"):
                         for n in names if st.session_state[f"alias_{n}"].strip()})
         st.rerun()
 
+with st.sidebar.expander("表示パネル"):
+    st.caption("詳細図に出すパネル。判定に不要なものを消して画面を軽くできます"
+               "(音声の有無は下の「音声」チェックが別に効きます)。")
+    for _k, _lbl, _ in PANEL_TOGGLES:
+        st.checkbox(_lbl, key=f"panel_{_k}")   # 既定は上で session_state に投入済み
+visible_panels = {k for k, _, _ in PANEL_TOGGLES if st.session_state[f"panel_{k}"]}
+
 dirs = {n: str(ARGS.bundles_dir / n) for n in sel_names}
 metas = {n: _meta(d) for n, d in dirs.items()}
+
+# メモ/★ はいま選んでいるバンドルの組み合わせ単位で保存する (ディレクトリ名
+# キー。表示名は編集できるのでキーにしない)。単一モデル = 1個の組み合わせ
+NOTES_PATH = N.notes_path(NOTES_DIR, sel_names)
+# ウィジェットキーにも組み合わせを混ぜる。混ぜないと key が既に session_state に
+# ある扱いになり、組み合わせを切り替えても前の組のメモ文字列が居座る
+NOTE_SCOPE = NOTES_PATH.stem
+st.sidebar.caption("メモ/★の保存単位: " + " + ".join(LABEL[n] for n in sorted(sel_names)))
 
 # comparison-mode precondition: same event universe (§7.3)
 if mode == "比較":
@@ -214,7 +268,7 @@ df_unfiltered = df.copy()
 meta0 = metas[sel_names[0]]
 
 # -- filters ----------------------------------------------------------------
-notes = N.load_notes(NOTES_PATH)   # {event_key: {"memo","bookmark",...}}
+notes = N.load_notes(NOTES_PATH)   # この組み合わせ専用 {event_key: {"memo",...}}
 
 st.sidebar.subheader("フィルタ")
 if st.sidebar.checkbox("★ ブックマークのみ", value=False):
@@ -247,21 +301,26 @@ else:
     sel_gold = st.sidebar.multiselect("gold (空=全て)", gold_vals)
     if sel_gold:
         df = df[df["gold"].isin(sel_gold)]
-    only_ng_of = {f"{LABEL[n]} のみNG": n for n in sel_names}
-    patterns = ["すべて", "いずれかNG", "全モデルNG"] + list(only_ng_of)
-    pat = st.sidebar.selectbox("正誤パターン", patterns, index=1)
+    # 正誤の絞り込み: 安価なプリセット + モデル毎の3択 (指定なし/正解のみ/
+    # 誤りのみ)。3択なら「Xのみ正解」も任意の組み合わせも 3^N 通り表せる
+    # ("いずれかNG" はORなのでモデル毎のANDでは書けず、プリセットに残す)
+    # 既定値は上で session_state に投入済み (index= を渡すと警告ログが出る)
+    pat = st.sidebar.selectbox("正誤パターン", OKNG_PATTERNS, key="okng_pattern")
     corr = df[[f"correct_{n}" for n in sel_names]]
     if pat == "いずれかNG":
         df = df[~corr.all(axis=1)]
     elif pat == "全モデルNG":
         df = df[~corr.any(axis=1)]
-    elif pat in only_ng_of:
-        ng_model = only_ng_of[pat]
-        m = ~df[f"correct_{ng_model}"]
+    elif pat == "モデル別指定":
+        st.sidebar.caption("モデル毎に 正解のみ / 誤りのみ を指定 "
+                           "(例: A=正解のみ + B=誤りのみ = 「Aだけ当てた」)。")
         for n in sel_names:
-            if n != ng_model:
-                m &= df[f"correct_{n}"]
-        df = df[m]
+            pick = st.sidebar.radio(LABEL[n], OKNG_CHOICES,
+                                    horizontal=True, key=f"okng_{n}")
+            if pick == "正解のみ":
+                df = df[df[f"correct_{n}"]]
+            elif pick == "誤りのみ":
+                df = df[~df[f"correct_{n}"]]
 
 sort_keys = {"確信度(|score-thr|)": "margin", "時刻": "t_sec", "セッション": "session"}
 if mode == "比較":
@@ -325,16 +384,20 @@ with right:
     margin_sec = st.slider("表示幅 (イベント前後, 秒)", 2.0, 20.0, 6.0, 0.5)
     show_audio = st.checkbox("音声", value=True)
 
-    # -- memo / bookmark (persisted to NOTES_PATH, shared across modes) ----
+    # -- memo / bookmark (persisted to NOTES_PATH = この組み合わせ専用) -----
     ek = case["event_key"]
     note = notes.get(ek, {})
     note_ctx = {"session": sid, "task": task, "t_sec": float(case["t_sec"])}
+    memo_key, bm_key = f"memo_{NOTE_SCOPE}_{ek}", f"bm_{NOTE_SCOPE}_{ek}"
+    note_ctx_args = (ek, note_ctx, NOTES_PATH, sorted(sel_names))
     st.toggle("★ ブックマーク", value=bool(note.get("bookmark")),
-              key=f"bm_{ek}", on_change=_save_bookmark, args=(ek, note_ctx))
-    st.text_area("メモ", value=note.get("memo", ""), key=f"memo_{ek}",
+              key=bm_key, on_change=_save_bookmark,
+              args=(bm_key, *note_ctx_args))
+    st.text_area("メモ", value=note.get("memo", ""), key=memo_key,
                  height=110, placeholder="このケースの特徴・気づきを記録")
-    st.button("メモを保存", key=f"savememo_{ek}",
-              on_click=_save_memo, args=(ek, note_ctx), width="stretch")
+    st.button("メモを保存", key=f"savememo_{NOTE_SCOPE}_{ek}",
+              on_click=_save_memo, args=(memo_key, *note_ctx_args),
+              width="stretch")
     if note.get("updated"):
         st.caption(f"最終更新: {note['updated']}")
 
@@ -418,7 +481,7 @@ with left:
     fig = P.detail_figure(
         case=case0, probs=probs0, meta=meta0, cases_win=cases_win,
         t0=t0, t1=t1, wav=wav, wav_sr=wav_sr, wav_t0=t0,
-        token_sets=token_sets, overlays=overlays,
+        token_sets=token_sets, overlays=overlays, visible=visible_panels,
     )
     if wav is not None and wav_sr:
         # figure + audio in one component: playhead overlaid on the figure,
@@ -478,7 +541,7 @@ with right:
         doc = X.standalone_case_html(
             title=f"VAPケース {sid} @ {t_ev:.2f}s ({task})",
             info_rows=info_rows,
-            memo=st.session_state.get(f"memo_{ek}", note.get("memo", "")),
+            memo=st.session_state.get(memo_key, note.get("memo", "")),
             player_fragment=player_html,
             models=model_rows,
             token_snapshots=token_snapshots,

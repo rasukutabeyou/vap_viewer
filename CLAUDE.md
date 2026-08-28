@@ -21,7 +21,15 @@
   単一モデル / 複数モデル比較の2モード。比較joinキーは
   `(session, task, silence_start, pre_speaker)`（イベント集合はVAD由来でモデル非依存）
 - `bundles/<exp名>/` — cases.parquet, probs/<session>.npz, tokens/<session>.jsonl, meta.json。
-  表示名は `bundles/aliases.json`、メモ/★は `bundles/notes.json`（event_keyキー・atomic write）
+  表示名は `bundles/aliases.json`、メモ/★は `bundles/notes/<組み合わせ>.json`
+  （`--notes-dir`。event_keyキー・atomic write）。**組み合わせ = 選択中バンドルの
+  ディレクトリ名をソートして `+` 連結**（>200字は sha1[:12]。JSON の `bundles` に
+  メンバーを常に記録）。{A,B} で書いたメモは単一Aからは見えない（意図的に厳密分離）。
+  ver1.1.1 までの共有 `notes.json` は `bundles/notes_archive/` に隔離済み・互換なし
+- 詳細図のパネルは `plots.detail_figure(visible=...)` で出し入れ（単位は
+  `wave/vad/events/bins/tokens/score/p_shift/p_now/p_future`、p_now/p_future は既定OFF）。
+  UIは `st.session_state["panel_<単位>"]`。全部OFFのときは vad を1枚残す
+  （`plt.subplots(0,1)` は作れず、図プレーヤーの transData 対応にも軸が1つ要る）
 - 起動: `.venv/bin/streamlit run app/viewer.py -- --bundles-dir bundles --audio-root <wav共有>`
 
 ## ハマり所（再発させない）
@@ -33,7 +41,27 @@
 - figure_player_html: `bbox_inches='tight'` 禁止（時刻→ピクセル対応が狂う）。
   座標は ax.transData で fx0/fx1 を渡す方式
 - チャンネル契約は **L=operator / R=user**（花川氏環境は逆。彼らのバンドルと直接joinしない）
+- `st.stop()`（比較モードでバンドル1つ以下）を跨ぐと、その run で描かれなかった
+  ウィジェットの session_state キーが掃除される → `panel_*` / `okng_pattern` /
+  `okng_<バンドル>` はモード radio の直後で毎run
+  `st.session_state[k] = st.session_state.get(k, 既定)` して延命している
+  （消すと表示パネル設定やモデル別正誤指定が既定に戻る。`okng_*` は
+  「モデル別指定」を選んだ run しか描かれないので、プリセットを往復するだけでも
+  消える。回帰テストあり）。既定値はこの代入で入れ、
+  `st.checkbox` に `value=` は渡さない（併用すると streamlit が
+  "created with a default value but also had its value set via the Session State API"
+  をスタック付きでログに吐く）
 
 ## 検証方法
-UIの回帰は Streamlit `AppTest`（単一/比較・メモ/★永続化・フィルタの6項目）、
+UIの回帰は Streamlit `AppTest` = `tests/test_viewer.py`（単一/比較・メモ/★の
+組み合わせ別永続化・パネルトグル・モデル別正誤フィルタ）。実行は
+`.venv/bin/python -m pytest tests -q`（pytest は dev専用。`app/requirements.txt`
+には入れない）。実 `bundles/` を読むので未生成環境ではskip、メモは必ず tmp_path へ。
 描画整合は headless Chrome で実描画確認。抽出器は既存expとのビット一致回帰。
+
+- AppTest は `st.dataframe` の行選択を再現できない → `at.session_state
+  ["last_event_key"]` を実 event_key にしてフォールバック経路で詳細を出す。
+  引数は `AppTest.from_file` に渡せないので `sys.argv` を差し替える
+- メモ系ウィジェットの `key` には**組み合わせを混ぜる**（`memo_<scope>_<ek>`）。
+  混ぜないと session_state に値が残り、組み合わせを切り替えても前の組の
+  メモ文字列が居座る（`value=` は既存キーがあると無視される）
