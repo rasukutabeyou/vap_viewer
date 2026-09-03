@@ -336,3 +336,73 @@ def test_bookmark_only_filter_uses_the_combination_file(tmp_path):
     bm.set_value(True).run()
     assert not at.exception
     assert _n_cases(at) == 1
+
+
+# --------------------------------------------------------------------------
+# 16. P(SHIFT) の評価窓ズーム: 既定OFF・st.stop() を跨いでも残る
+# --------------------------------------------------------------------------
+
+
+def test_pshift_zoom_default_off_and_survives_stop(tmp_path):
+    at = _app(tmp_path).run()
+    assert at.checkbox(key="pshift_zoom").value is False
+    at.checkbox(key="pshift_zoom").set_value(True).run()
+    at.sidebar.radio[0].set_value("比較").run()
+    at.sidebar.multiselect[0].set_value([A_NAME]).run()      # st.stop() する run
+    at.sidebar.multiselect[0].set_value([A_NAME, B_NAME]).run()
+    assert not at.exception
+    assert at.checkbox(key="pshift_zoom").value is True
+
+
+# --------------------------------------------------------------------------
+# 17. ズームは評価窓の値と閾値を必ず含み、固定レンジより狭くなる
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def zoom_case():
+    """評価窓の中が閾値よりずっと低い shift_hold ケースを探して返す。
+
+    ハードコードすると「窓の中で曲線が 1.0 近くまで振れるケース」を引いた
+    ときに拡大が効かず、テストが本質と無関係に落ちる。"""
+    d = str(BUNDLES / A_NAME)
+    meta = B.load_meta(d)
+    cases = B.load_cases(d)
+    fhz = float(meta["frame_hz"])
+    zcfg = meta["zero_shot_config"]
+    sid = cases[cases["event_key"] == EVENT_KEY].iloc[0]["session"]
+    probs = B.load_probs(d, sid)
+    win = cases[(cases["session"] == sid) & (cases["task"] == "shift_hold")]
+    best = None
+    for _, row in win.iterrows():
+        c = row.to_dict()
+        ws, we = P._eval_window_sec(c, zcfg, fhz)
+        seg = P._pshift_curve(probs, c)[int(ws * fhz): int(we * fhz) + 1]
+        if not len(seg):
+            continue
+        m = float(seg.max())
+        if best is None or m < best[0]:
+            best = (m, c)
+    if best is None:
+        pytest.skip("評価窓に収まる shift_hold ケースが無い")
+    wmax, case = best
+    return dict(case=case, probs=probs, meta=meta, cases_win=win,
+                t0=max(0.0, case["t_sec"] - 6), t1=case["t_sec"] + 6), wmax
+
+
+def test_pshift_zoom_fits_the_eval_window(zoom_case):
+    import matplotlib.pyplot as plt
+    kw, wmax = zoom_case
+    thr = float(kw["case"]["threshold"])
+
+    fixed = P.detail_figure(**kw, visible={"p_shift"}, pshift_zoom=False)
+    lo_f, hi_f = fixed.axes[-1].get_ylim()
+    plt.close(fixed)
+    zoomed = P.detail_figure(**kw, visible={"p_shift"}, pshift_zoom=True)
+    lo_z, hi_z = zoomed.axes[-1].get_ylim()
+    plt.close(zoomed)
+
+    assert (lo_f, hi_f) == (0.0, 1.0)        # shift_hold の従来レンジ
+    assert hi_z < hi_f                       # 実際に拡大されている
+    assert lo_z <= thr <= hi_z               # 閾値の破線が画面内に残る
+    assert hi_z >= wmax and lo_z <= 0        # 評価窓の値も入る

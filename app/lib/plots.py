@@ -267,6 +267,36 @@ def _panel_tokens(ax, tokens, frame_hz, t0, t1):
             ha="right", va="bottom", zorder=5)
 
 
+def _legend(ax) -> None:
+    """凡例。拡大後は曲線がパネル上端まで来るので白地を敷いて読めるようにする。"""
+    ax.legend(loc="upper right", fontsize=7, ncol=2, frameon=True,
+              framealpha=0.8, edgecolor="none", facecolor="white",
+              borderpad=0.2, handlelength=1.2)
+
+
+def _yrange(curves, thresholds=(), min_span: float = 0.08,
+            lo_cap: float = -0.02, hi_cap: float = 1.0):
+    """閾値まわりを拡大した y レンジ。
+
+    渡すのは**評価窓の中だけ**の曲線と全モデルの閾値 (比較モードは閾値が
+    モデル毎に違うので全部含めないと破線が画面外に出る)。窓の外まで含めて
+    合わせても発話中に 0.95 まで振れるので 0..1 のままになり意味がない。
+    平坦な曲線でノイズが拡大されないよう幅は ``min_span`` を下限にする。"""
+    vals: list[float] = [float(v) for v in thresholds
+                         if v is not None and v == v]
+    for y in curves:
+        y = np.asarray(y, dtype=np.float64)
+        if y.size and np.isfinite(y).any():
+            vals += [float(np.nanmin(y)), float(np.nanmax(y))]
+    if not vals:
+        return lo_cap, hi_cap
+    lo, hi = min(vals), max(vals)
+    mid, span = 0.5 * (lo + hi), max(hi - lo, min_span)
+    pad = 0.15 * span
+    return (max(lo_cap, mid - 0.5 * span - pad),
+            min(hi_cap, mid + 0.5 * span + pad))
+
+
 def _score_dot(ax, x, score, color):
     """The case score (eval-window mean) as a dot at the silence start.
     Above/below the dashed threshold line = pos/neg at a glance."""
@@ -285,12 +315,12 @@ def _panel_task_score(ax, probs, case, frame_hz, t0, t1):
     ax.plot(t, curves[:, 1], color=COL_B, lw=2, label="B")
     thr = case.get("threshold")
     if case["task"] == "shift_pred" and thr == thr:   # not NaN
-        ax.axhline(thr, color=INK, lw=1, ls="--")
+        ax.axhline(thr, color=INK, lw=1.4, ls="--")
         ax.text(t1, thr, f" thr={thr:.3f}", fontsize=7, color=INK, va="bottom", ha="right")
         _score_dot(ax, case["silence_start"] / frame_hz, case.get("score"),
                    COL_OK if case.get("correct") else COL_NG)
     ax.set_ylim(-0.02, max(0.5, float(curves.max()) * 1.15) if len(curves) else 1)
-    ax.legend(loc="upper right", fontsize=7, frameon=False, ncol=2)
+    _legend(ax)
 
 
 def _pshift_curve(probs: dict, case: dict) -> np.ndarray:
@@ -306,7 +336,8 @@ def _pshift_curve(probs: dict, case: dict) -> np.ndarray:
     return probs["score_spred"][:, int(case["post_speaker"])]
 
 
-def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
+def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None,
+                  zoom=False):
     """SHIFT-oriented decision panel: curve above its (dashed) threshold in
     the shaded eval window = that model predicted SHIFT."""
     a, b = int(max(0, t0 * frame_hz)), int(t1 * frame_hz) + 1
@@ -316,15 +347,21 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
     is_sh = case["task"] == "shift_hold"
     t_event = case["silence_start"] / frame_hz
     ymax = 0.25
+    # zoom 用: 評価窓の中の曲線と、全モデルの閾値
+    wi0, wi1 = int(ws * frame_hz), int(we * frame_hz) + 1
+    ys: list[np.ndarray] = []
+    thrs: list[float] = []
     if overlays:
         for i, (ov, col) in enumerate(zip(overlays, MODEL_COLORS)):
             curve = _pshift_curve(ov["probs"], case)
             t = np.arange(a, min(b, len(curve))) / frame_hz
             y = curve[a: a + len(t)]
             ax.plot(t, y, color=col, lw=2, label=ov["name"])
+            ys.append(curve[wi0:wi1])
             thr = ov.get("threshold")
             if thr is not None and thr == thr:
-                ax.axhline(thr, color=col, lw=1, ls="--", alpha=0.8)
+                thrs.append(float(thr))
+                ax.axhline(thr, color=col, lw=1.4, ls="--", alpha=0.8)
             _score_dot(ax, t_event, ov.get("score"), col)
             if len(y):
                 ymax = max(ymax, float(y.max()))
@@ -335,15 +372,17 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
             ax.text(we + 0.05, 0.9 - 0.28 * i, letter, color=col,
                     fontsize=9, fontweight="bold", clip_on=True,
                     transform=ax.get_xaxis_transform())
-        ax.legend(loc="upper right", fontsize=7, frameon=False, ncol=2)
+        _legend(ax)
     else:
         curve = _pshift_curve(probs, case)
         t = np.arange(a, min(b, len(curve))) / frame_hz
         y = curve[a: a + len(t)]
         ax.plot(t, y, color=INK, lw=2)
+        ys.append(curve[wi0:wi1])
         thr = case.get("threshold")
         if thr is not None and thr == thr:
-            ax.axhline(thr, color=INK, lw=1, ls="--", alpha=0.8)
+            thrs.append(float(thr))
+            ax.axhline(thr, color=INK, lw=1.4, ls="--", alpha=0.8)
             ax.text(t1, thr, f" thr={thr:.3f}", fontsize=7, color=INK,
                     va="bottom", ha="right")
         _score_dot(ax, t_event, case.get("score"),
@@ -351,16 +390,23 @@ def _panel_pshift(ax, probs, case, zcfg, frame_hz, t0, t1, overlays=None):
         if len(y):
             ymax = max(ymax, float(y.max()))
 
-    if is_sh:
+    if zoom:
+        # 評価窓の判定域だけを拡大 (窓外のピークは切れる)。目盛りは固定せず
+        # matplotlib に任せる: 拡大先に [0, 0.5, 1] が1つも入らないと消える
+        ax.set_ylim(*_yrange(ys, thrs))
+    elif is_sh:
         ax.set_ylim(0, 1)
         ax.set_yticks([0, 0.5, 1])
-        note = "P(SHIFT)  ↑=SHIFT予測 / ↓=HOLD予測 (破線=閾値)"
     else:
         ax.set_ylim(-0.02, ymax * 1.1)
+    if is_sh:
+        note = "P(SHIFT)  ↑=SHIFT予測 / ↓=HOLD予測 (破線=閾値)"
+    else:
         note = "S-predスコア(相手話者)  破線閾値より上=SHIFT予測"
-    ax.text(0.003, 0.84, note, transform=ax.transAxes,
-            fontsize=8, color=INK, fontweight="bold",
-            bbox=dict(fc="white", ec="none", alpha=0.75, pad=1.5))
+    # 軸の外(y>1)に置くと p_shift が最上段のとき figure からはみ出して切れる
+    ax.text(0.003, 0.88, note, transform=ax.transAxes, fontsize=8, color=INK,
+            fontweight="bold", va="top",
+            bbox=dict(fc="white", ec="none", alpha=0.85, pad=1.5))
 
 
 def _panel_prob(ax, curve, frame_hz, t0, t1, label, overlays=None):
@@ -418,6 +464,7 @@ def detail_figure(
     token_sets: list[tuple[str, object]] | None = None,
     overlays: list[dict] | None = None,
     visible: set[str] | None = None,
+    pshift_zoom: bool = False,
 ):
     """One figure, panels top to bottom (only those with data):
     wave A / wave B / VAD / events / bin heatmap / tokens (one panel per
@@ -431,6 +478,10 @@ def detail_figure(
 
     ``overlays`` (comparison mode): ``[{name, probs, threshold, pred,
     correct}, ...]`` -- one entry per model, first entry = primary bundle.
+
+    ``pshift_zoom``: P(SHIFT) パネルの y 軸を**評価窓の判定域**に拡大する
+    (既定 False)。閾値が 0.1 前後で窓の中の差が数pxしかない比較用。窓外の
+    ピークは切れるので既定は従来どおりの固定レンジ。
 
     ``visible``: 表示するパネル単位の集合 (``wave`` / ``vad`` / ``events`` /
     ``bins`` / ``tokens`` / ``score`` / ``p_shift`` / ``p_now`` /
@@ -455,8 +506,9 @@ def detail_figure(
     for i in range(len(token_sets)):
         panels += [(f"tokens{i}", 1.35)]     # 2 lanes x 3 text sub-rows
     if overlays is None:
-        panels += [("score", 1.0)]           # raw A/B curves (single model)
-    panels += [("p_shift", 1.0), ("p_now", 1.0), ("p_future", 1.0)]
+        panels += [("score", 1.6)]           # raw A/B curves (single model)
+    # 判定に効く score/P(SHIFT) は他より高くする (閾値が 0.1 前後で線が細かい)
+    panels += [("p_shift", 1.6), ("p_now", 1.0), ("p_future", 1.0)]
     if visible is not None:
         panels = [(n, h) for n, h in panels if _panel_unit(n) in visible]
         if not panels:                       # 全部OFF: 軸ゼロの図は作れない
@@ -469,7 +521,15 @@ def detail_figure(
     )
     # Rendered without bbox_inches="tight" (the figure-player overlay needs
     # stable pixel geometry), so trim the margins here instead.
-    fig.subplots_adjust(left=0.055, right=0.995, top=0.94, bottom=0.07)
+    # 上下は割合固定だとパネルを絞って図が低いとき絶対量が足りず、
+    # suptitle や time [s] の目盛りが切れる -> 最低限のインチ数を確保する
+    _h = fig.get_figheight()
+    _head, _foot = max(0.06, 0.40 / _h), max(0.07, 0.45 / _h)
+    if _head + _foot > 0.6:              # vad 1枚などの極端に低い図
+        _k = 0.6 / (_head + _foot)
+        _head, _foot = _head * _k, _foot * _k
+    fig.subplots_adjust(left=0.055, right=0.995,
+                        top=1 - _head, bottom=_foot)
     ax_of = dict(zip((n for n, _ in panels), np.atleast_1d(axes)))
 
     if "wave_a" in ax_of:
@@ -498,7 +558,7 @@ def detail_figure(
         _panel_task_score(ax_of["score"], probs, case, frame_hz, t0, t1)
     if "p_shift" in ax_of:
         _panel_pshift(ax_of["p_shift"], probs, case, zcfg, frame_hz, t0, t1,
-                      overlays=overlays)
+                      overlays=overlays, zoom=pshift_zoom)
     # overlay の列作りは該当パネルが出るときだけ
     if "p_now" in ax_of:
         ov_now = ([(o["name"], o["probs"]["p_now"]) for o in overlays]

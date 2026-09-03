@@ -30,6 +30,11 @@
   `wave/vad/events/bins/tokens/score/p_shift/p_now/p_future`、p_now/p_future は既定OFF）。
   UIは `st.session_state["panel_<単位>"]`。全部OFFのときは vad を1枚残す
   （`plt.subplots(0,1)` は作れず、図プレーヤーの transData 対応にも軸が1つ要る）
+- `detail_figure(pshift_zoom=True)`（UIは `st.session_state["pshift_zoom"]`・既定OFF・
+  `panel_*` と同じ延命が要る）は P(SHIFT) の y 軸を**評価窓の中**の曲線＋
+  **全モデルの閾値**に合わせる（`_yrange`）。窓の外まで含めて合わせると発話中に
+  0.95 まで振れるので 0..1 のままになり無意味 — 拡大の基準は必ず評価窓。
+  拡大時は `set_yticks([0,0.5,1])` を打たない（拡大先に1つも入らないと目盛りが消える）
 - 起動: `.venv/bin/streamlit run app/viewer.py -- --bundles-dir bundles --audio-root <wav共有>`
 
 ## ハマり所（再発させない）
@@ -39,7 +44,11 @@
   トークンの窓フィルタは **pos 基準**にする(`end > a0` だと open センチネルのせいで
   セッション開始からの全トークンが該当し、パネルも右ペインも全文まみれになる)
 - figure_player_html: `bbox_inches='tight'` 禁止（時刻→ピクセル対応が狂う）。
-  座標は ax.transData で fx0/fx1 を渡す方式
+  座標は ax.transData で fx0/fx1 を渡す方式。代わりに `subplots_adjust` で余白を
+  詰めるが、上下は**割合固定にしない**（パネルを絞ると図が低くなり suptitle や
+  `time [s]` が切れる）。必要インチ数から比率を出し、合計が 0.6 を超えたら
+  縮める（vad 1枚=0.84in で `bottom >= top` になり ValueError）。左右は
+  fx0/fx1 の前提なので 0.055/0.995 のまま触らない
 - チャンネル契約は **L=operator / R=user**（花川氏環境は逆。彼らのバンドルと直接joinしない）
 - `st.stop()`（比較モードでバンドル1つ以下）を跨ぐと、その run で描かれなかった
   ウィジェットの session_state キーが掃除される → `panel_*` / `okng_pattern` /
@@ -54,7 +63,8 @@
 
 ## 検証方法
 UIの回帰は Streamlit `AppTest` = `tests/test_viewer.py`（単一/比較・メモ/★の
-組み合わせ別永続化・パネルトグル・モデル別正誤フィルタ）。実行は
+組み合わせ別永続化・パネルトグル・モデル別正誤フィルタ・P(SHIFT)の評価窓
+ズーム）。実行は
 `.venv/bin/python -m pytest tests -q`（pytest は dev専用。`app/requirements.txt`
 には入れない）。実 `bundles/` を読むので未生成環境ではskip、メモは必ず tmp_path へ。
 描画整合は headless Chrome で実描画確認。抽出器は既存expとのビット一致回帰。

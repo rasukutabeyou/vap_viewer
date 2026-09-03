@@ -131,6 +131,7 @@ mode = st.sidebar.radio("モード", ["単一モデル", "比較"], horizontal=T
 for _k, _, _dflt in PANEL_TOGGLES:
     _pk = f"panel_{_k}"
     st.session_state[_pk] = st.session_state.get(_pk, _dflt)
+st.session_state["pshift_zoom"] = st.session_state.get("pshift_zoom", False)
 
 # モデル別正誤フィルタも同じ理由で延命する。描かれるのは「モデル別指定」を
 # 選んでいる run のバンドルの分だけなので、これが無いとプリセットを一度見て
@@ -212,6 +213,11 @@ with st.sidebar.expander("表示パネル"):
                "(音声の有無は下の「音声」チェックが別に効きます)。")
     for _k, _lbl, _ in PANEL_TOGGLES:
         st.checkbox(_lbl, key=f"panel_{_k}")   # 既定は上で session_state に投入済み
+    st.divider()
+    st.checkbox("P(SHIFT) を評価窓の判定域まで拡大", key="pshift_zoom")
+    st.caption("閾値は 0.1 前後で、評価窓の中の差は数pxしかありません。"
+               "ONで評価窓の値と全モデルの閾値が収まる範囲までY軸を拡大します"
+               "(窓の外のピークは切れます)。")
 visible_panels = {k for k, _, _ in PANEL_TOGGLES if st.session_state[f"panel_{k}"]}
 
 dirs = {n: str(ARGS.bundles_dir / n) for n in sel_names}
@@ -482,6 +488,7 @@ with left:
         case=case0, probs=probs0, meta=meta0, cases_win=cases_win,
         t0=t0, t1=t1, wav=wav, wav_sr=wav_sr, wav_t0=t0,
         token_sets=token_sets, overlays=overlays, visible=visible_panels,
+        pshift_zoom=st.session_state["pshift_zoom"],
     )
     if wav is not None and wav_sr:
         # figure + audio in one component: playhead overlaid on the figure,
