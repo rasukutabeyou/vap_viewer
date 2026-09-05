@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # v2: + bc_pred / short_long tasks, win_start/win_end, score_bc
 
 # Tolerance for float metric comparison against the saved json. Counts
 # (tp/fp/tn/fn/n_pos/n_neg) are compared exactly.
@@ -53,7 +53,8 @@ FLOAT_RTOL = 1e-6
 
 CASE_COLUMNS = [
     "exp", "session", "task", "event_key", "t_sec",
-    "silence_start", "silence_end", "pre_speaker", "post_speaker",
+    "silence_start", "silence_end", "win_start", "win_end",
+    "pre_speaker", "post_speaker",
     "gold", "pred", "score", "threshold", "correct", "margin",
 ]
 
@@ -123,11 +124,27 @@ def _now_future(bin_probs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # --------------------------------------------------------------------------
 
 
+def _check_windows(sid, what, kept, triples, plan_arr):
+    """The recomputed (start, end, speaker) windows must equal the plan's --
+    catches speaker mixups, not just count drift."""
+    got = np.asarray(triples, dtype=np.int64).reshape(len(kept), 3)
+    if got.shape[0] != plan_arr.shape[0] or not np.array_equal(got, plan_arr):
+        raise RuntimeError(
+            f"{sid}: {what} event windows do not match the session plan "
+            f"({got.shape[0]} vs {plan_arr.shape[0]} events)")
+
+
 def _session_cases(sid, probs, vad_full, T, plan, zcfg, masks, thresholds, exp_name,
-                   find_shift_hold_events):
+                   find_shift_hold_events, find_backchannels=None):
     """Build case rows for one session. Score arithmetic replicates
     `_score_session` expression-for-expression so the parquet rows are
-    bit-identical with the samples used for metric verification."""
+    bit-identical with the samples used for metric verification.
+
+    Tasks: shift_hold (event S/H), shift_pred (positive windows, miss-centric),
+    bc_pred (positive windows before a backchannel, miss-centric), short_long
+    (onset windows: SHORT = backchannel onsets, LONG = post-shift onsets).
+    shift_pred / bc_pred metrics in the json are frame-level; the per-case
+    score here is the window mean, consistent with how a window is 'missed'."""
     frame_hz = zcfg.frame_hz
     vad = vad_full[:T].astype(np.float32)
     min_ctx = int(round(zcfg.min_context_sec * frame_hz))
@@ -169,6 +186,7 @@ def _session_cases(sid, probs, vad_full, T, plan, zcfg, masks, thresholds, exp_n
             event_key=f"{sid}|shift_hold|{ev.silence_start}|{ev.pre_speaker}",
             t_sec=ev.silence_start / frame_hz,
             silence_start=int(ev.silence_start), silence_end=int(ev.silence_end),
+            win_start=int(s), win_end=int(e),
             pre_speaker=int(ev.pre_speaker), post_speaker=int(ev.post_speaker),
             gold=gold, pred=pred, score=score_shift,
             threshold=float(thr_sh) if thr_sh is not None else math.nan,
@@ -203,12 +221,108 @@ def _session_cases(sid, probs, vad_full, T, plan, zcfg, masks, thresholds, exp_n
             event_key=f"{sid}|shift_pred|{ev.silence_start}|{ev.pre_speaker}",
             t_sec=ev.silence_start / frame_hz,
             silence_start=int(ev.silence_start), silence_end=int(ev.silence_end),
+            win_start=int(s), win_end=int(e),
             pre_speaker=int(ev.pre_speaker), post_speaker=int(ev.post_speaker),
             gold="pos", pred="pos" if pred_pos else "neg", score=sc,
             threshold=float(thr_sp) if thr_sp is not None else math.nan,
             correct=bool(pred_pos),
             margin=abs(sc - thr_sp) if thr_sp is not None else math.nan,
         ))
+
+    if find_backchannels is None:
+        return rows, score
+
+    # -- bc_pred + short_long: backchannel events (same call as _plan_session).
+    bcs = find_backchannels(
+        vad, frame_hz,
+        bc_duration_sec=zcfg.bc_duration_sec,
+        pre_silence_sec=zcfg.bc_pre_silence_sec,
+        post_silence_sec=zcfg.bc_post_silence_sec,
+    )
+
+    # -- bc_pred: positive windows before each BC onset, miss(FN)-centric
+    #    like shift_pred (negatives are diffuse frames, not events).
+    bc_dur = int(round(zcfg.bcpred_eval_dur_sec * frame_hz))
+    kept_bc = []
+    for bc in bcs:
+        s = max(min_ctx, bc.start - bc_dur)
+        e = bc.start
+        if e - s < 1:
+            continue
+        kept_bc.append((bc, s, e))
+    _check_windows(sid, "bc_pred", kept_bc,
+                   [(s, e, bc.speaker) for bc, s, e in kept_bc], plan.bcpred_pos)
+
+    thr_bc = thresholds.get("bc_pred")
+    for bc, s, e in kept_bc:
+        w = score[f"bc_{int(bc.speaker)}"][s:e]
+        sc = float(w.mean())
+        pred_pos = thr_bc is not None and sc >= thr_bc
+        rows.append(dict(
+            exp=exp_name, session=sid, task="bc_pred",
+            event_key=f"{sid}|bc_pred|{bc.start}|{bc.speaker}",
+            t_sec=bc.start / frame_hz,
+            silence_start=int(bc.start), silence_end=int(bc.end),   # BC extent
+            win_start=int(s), win_end=int(e),
+            pre_speaker=int(1 - bc.speaker), post_speaker=int(bc.speaker),
+            gold="pos", pred="pos" if pred_pos else "neg", score=sc,
+            threshold=float(thr_bc) if thr_bc is not None else math.nan,
+            correct=bool(pred_pos),
+            margin=abs(sc - thr_bc) if thr_bc is not None else math.nan,
+        ))
+
+    # -- short_long: SHORT = BC onsets (gold short), LONG = post-shift onsets
+    #    (gold long); both scored on the bc subset of the onsetting speaker.
+    sl_dur = int(round(zcfg.sl_eval_dur_sec * frame_hz))
+    kept_sl_pos = []
+    for bc in bcs:
+        s = bc.start
+        e = min(T, s + sl_dur)
+        if s < min_ctx or e - s < 1:
+            continue
+        kept_sl_pos.append((bc, s, e))
+    _check_windows(sid, "short_long(short)", kept_sl_pos,
+                   [(s, e, bc.speaker) for bc, s, e in kept_sl_pos], plan.sl_pos)
+    kept_sl_neg = []
+    for ev in sh_events:
+        if not ev.is_shift:
+            continue
+        s = ev.silence_end
+        e = min(T, s + sl_dur)
+        if s < min_ctx or e - s < 1:
+            continue
+        kept_sl_neg.append((ev, s, e))
+    _check_windows(sid, "short_long(long)", kept_sl_neg,
+                   [(s, e, ev.post_speaker) for ev, s, e in kept_sl_neg], plan.sl_neg)
+
+    thr_sl = thresholds.get("short_long")
+
+    def _sl_row(spk, s, e, gold, t_ev, span_s, span_e, pre_spk):
+        w = score[f"bc_{int(spk)}"][s:e]
+        sc = float(w.mean())
+        pred = "short" if (thr_sl is not None and sc >= thr_sl) else "long"
+        # gold in the key: a BC onset and a post-shift onset can in principle
+        # share (frame, speaker); gold is model-independent so joins are safe.
+        return dict(
+            exp=exp_name, session=sid, task="short_long",
+            event_key=f"{sid}|short_long|{s}|{spk}|{gold}",
+            t_sec=t_ev / frame_hz,
+            silence_start=int(span_s), silence_end=int(span_e),
+            win_start=int(s), win_end=int(e),
+            pre_speaker=int(pre_spk), post_speaker=int(spk),
+            gold=gold, pred=pred, score=sc,
+            threshold=float(thr_sl) if thr_sl is not None else math.nan,
+            correct=(gold == pred),
+            margin=abs(sc - thr_sl) if thr_sl is not None else math.nan,
+        )
+
+    for bc, s, e in kept_sl_pos:
+        rows.append(_sl_row(bc.speaker, s, e, "short",
+                            bc.start, bc.start, bc.end, 1 - bc.speaker))
+    for ev, s, e in kept_sl_neg:
+        rows.append(_sl_row(ev.post_speaker, s, e, "long",
+                            ev.silence_end, ev.silence_start, ev.silence_end,
+                            ev.pre_speaker))
 
     return rows, score
 
@@ -327,6 +441,11 @@ def main(argv=None) -> int:
     import torch
 
     from vapx.eval.events import find_shift_hold_events
+
+    try:
+        from vapx.eval.events import find_backchannels
+    except ImportError:        # very old vapx: fall back to sh/spred only
+        find_backchannels = None
     from vapx.eval.inference import iter_session_inputs, predict_session
     from vapx.eval.metrics import binary_metrics
     from vapx.eval.zero_shot import (
@@ -355,6 +474,13 @@ def main(argv=None) -> int:
     has_vis_eval = "vis_encoders" in ps_params
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "cpu" and not args.limit_sessions:
+        # tabidachi-scale sessions (~20 min audio) take ~20 min EACH on CPU;
+        # a full split is >10 h. CPU is only sensible for --limit-sessions
+        # smoke tests -- full bundles must be extracted on GPU.
+        print("[extract] WARNING: full extraction on CPU is impractically "
+              "slow (~20 min/session). Use a GPU, or --limit-sessions N "
+              "for a quick partial bundle.")
     print(f"[extract] loading {ckpt_path} on {device}")
     bundle = load_for_inference(ckpt_path, device=device)
     feature, model, labeler = bundle["feature"], bundle["model"], bundle["labeler"]
@@ -404,7 +530,16 @@ def main(argv=None) -> int:
         for key, enc in (bundle.get("vis_encoders") or {}).items():
             enc = enc.to(device)
             if key in ckpt_vis:
-                enc.load_state_dict(ckpt_vis[key])
+                try:
+                    enc.load_state_dict(ckpt_vis[key])
+                except RuntimeError as exc:
+                    sys.exit(
+                        f"[extract] vis encoder {key!r}: checkpoint weights do not "
+                        f"fit the encoder built by the CURRENT vapx code -- the "
+                        f"encoder architecture changed after this exp was trained. "
+                        f"Extraction needs the vapx code version that trained the "
+                        f"checkpoint (its outputs must also match the zero_shot "
+                        f"json).\n  underlying error: {exc}")
             vis_encoders[key] = enc.eval()
     vis_dirs = {k: data_cfg.get(k) for k in ("gaze_dir", "head_dir", "au_dir")}
     use_vis = bool(has_vis_eval and vis_encoders and any(vis_dirs.values()))
@@ -418,9 +553,11 @@ def main(argv=None) -> int:
               f"roles=({vis_role_a},{vis_role_b}) ratio={vis_audio_ratio}")
 
     zs_saved = json.loads(zs_json_path.read_text())
+    task_names = ("shift_hold", "shift_pred") if find_backchannels is None else \
+                 ("shift_hold", "shift_pred", "bc_pred", "short_long")
     thresholds = {
         t: zs_saved[t]["threshold"]
-        for t in ("shift_hold", "shift_pred")
+        for t in task_names
         if t in zs_saved and "threshold" in zs_saved[t]
     }
     if not thresholds:
@@ -452,7 +589,11 @@ def main(argv=None) -> int:
         entry, wav, vad_full = item[0], item[1], item[2]
         vis_a = item[3] if len(item) > 3 else None
         vis_b = item[4] if len(item) > 4 else None
-        sid = entry["id"]
+        # manifest id key differs per recipe ("id" / "session"); mirror
+        # vapx.eval.inference.iter_session_inputs resolution.
+        sid = entry.get("session") or entry.get("id")
+        if not sid:
+            raise KeyError(f"manifest entry has neither 'session' nor 'id': {entry}")
         fwd_kwargs: dict = {}
         if lang_dir is not None:
             fwd_kwargs["lang"] = _load_session_lang(lang_dir, sid)
@@ -475,13 +616,12 @@ def main(argv=None) -> int:
 
         rows, score = _session_cases(
             sid, probs, vad_full, T, plan, zcfg, masks, thresholds, exp_name,
-            find_shift_hold_events)
+            find_shift_hold_events, find_backchannels)
         all_rows.extend(rows)
 
         bin_probs = (probs[:T] @ bitmask).reshape(T, zcfg.num_bins, 2)
         p_now, p_future = _now_future(bin_probs)
-        np.savez_compressed(
-            probs_dir / f"{sid}.npz",
+        npz_arrays = dict(
             p_now=p_now.astype(np.float16),
             p_future=p_future.astype(np.float16),
             bin_probs=bin_probs.astype(np.float16),
@@ -490,6 +630,10 @@ def main(argv=None) -> int:
             vad=(vad_full[:T] > 0).astype(np.uint8),
             frame_hz=np.float32(zcfg.frame_hz),
         )
+        if "bc_0" in score:      # bc subset masks (bc_pred / short_long panels)
+            npz_arrays["score_bc"] = np.stack(
+                [score["bc_0"], score["bc_1"]], axis=1).astype(np.float16)
+        np.savez_compressed(probs_dir / f"{sid}.npz", **npz_arrays)
 
         if token_exporter is not None and tokens_ok:
             try:
@@ -522,7 +666,10 @@ def main(argv=None) -> int:
     if args.limit_sessions:
         print("[extract] --limit-sessions given: skipping metric verification")
     else:
-        for task, store in (("shift_hold", stores.sh), ("shift_pred", stores.spred)):
+        task_stores = [("shift_hold", stores.sh), ("shift_pred", stores.spred)]
+        if find_backchannels is not None:
+            task_stores += [("bc_pred", stores.bcpred), ("short_long", stores.sl)]
+        for task, store in task_stores:
             if task not in thresholds:
                 continue
             v = _verify_task(task, store, zs_saved[task], args.split, binary_metrics)
@@ -558,6 +705,18 @@ def main(argv=None) -> int:
         except Exception:
             return None
 
+    def _git_dirty(repo: Path) -> bool | None:
+        """True when the vapx working tree has uncommitted changes -- the
+        recorded commit hash then does NOT identify the code that ran."""
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo), "status", "--porcelain"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            return bool(out.strip())
+        except Exception:
+            return None
+
     import vapx
 
     meta = {
@@ -568,6 +727,7 @@ def main(argv=None) -> int:
         "split": args.split,
         "generated_at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "vapx_git_commit": _git_commit(Path(vapx.__file__).parent),
+        "vapx_git_dirty": _git_dirty(Path(vapx.__file__).parent),
         "frame_hz": float(zcfg.frame_hz),
         "num_bins": int(zcfg.num_bins),
         "bin_times_sec": list(getattr(labeler, "bin_times_sec", [])),

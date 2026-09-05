@@ -4,6 +4,9 @@ no vapx / torch / checkpoints (constraint C1/C2 of the spec)."""
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -141,3 +144,52 @@ def read_stereo_crop(path_l: Path | None, path_r: Path | None,
     n = min(len(w) for w in parts if w is not None)
     chans = [w[:n] if w is not None else np.zeros(n, dtype=np.float32) for w in parts]
     return np.stack(chans, axis=0), sr
+
+
+# --------------------------------------------------------------------------
+# video (referenced like audio; cropped on demand with ffmpeg)
+# --------------------------------------------------------------------------
+
+
+def _ffmpeg_exe() -> str | None:
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def resolve_session_video(sid: str, video_root: Path | None) -> Path | None:
+    """``video_root/<sid>.mp4`` if it exists."""
+    if video_root is None:
+        return None
+    p = Path(video_root) / f"{sid}.mp4"
+    return p if p.is_file() else None
+
+
+def read_video_crop(path: Path, start_sec: float, dur_sec: float,
+                    max_width: int = 960, with_audio: bool = False) -> bytes | None:
+    """Transcode [start, start+dur] to a small MP4 (bytes). The in-app player
+    mutes it (audio comes from the wav crop); exports keep the source audio.
+
+    The Tabidachi zoom videos are two 16:9 face tiles letterboxed into the
+    middle half of the frame -- crop that band so the faces render large."""
+    exe = _ffmpeg_exe()
+    if exe is None:
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        out = tmp.name
+    audio = ["-c:a", "aac", "-b:a", "96k"] if with_audio else ["-an"]
+    cmd = [exe, "-y", "-loglevel", "error",
+           "-ss", f"{max(0.0, start_sec):.3f}", "-i", str(path),
+           "-t", f"{dur_sec:.3f}", *audio,
+           "-vf", f"crop=iw:ih/2:0:ih/4,scale='min({max_width},iw)':-2",
+           "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
+           "-movflags", "+faststart", out]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        return Path(out).read_bytes()
+    except Exception:
+        return None
+    finally:
+        Path(out).unlink(missing_ok=True)

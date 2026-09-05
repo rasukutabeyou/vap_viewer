@@ -29,6 +29,7 @@ def figure_player_html(
     sr: int,
     t0: float,                 # absolute session time of crop start [s]
     t1: float,                 # absolute session time of crop end   [s]
+    video: bytes | None = None,  # muted MP4 crop of the same [t0, t1] window
 ) -> tuple[str, int]:
     """Return (html, initial_height) for st.components.v1.html.
 
@@ -58,9 +59,20 @@ def figure_player_html(
     }
     aspect = h_px / w_px
 
+    vid_html = ""
+    vid_h = 0
+    if video is not None:
+        vid_b64 = base64.b64encode(video).decode("ascii")
+        vid_h = 270          # height estimate at ~900px column (32:9 crop)
+        vid_html = f"""
+  <video id="vid" muted playsinline preload="auto"
+         src="data:video/mp4;base64,{vid_b64}"
+         style="display:block; width:100%; height:auto;
+                margin:0 0 6px;"></video>"""
+
     html = f"""
 <meta charset="utf-8">
-<div style="font-family: sans-serif;">
+<div style="font-family: sans-serif;">{vid_html}
   <div id="wrap" style="position:relative; cursor:pointer; line-height:0;">
     <img id="fig" src="data:image/png;base64,{png_b64}"
          style="width:100%; display:block;" draggable="false">
@@ -78,6 +90,14 @@ const au = document.getElementById("au");
 const head = document.getElementById("head");
 const pos = document.getElementById("pos");
 const wrap = document.getElementById("wrap");
+const vid = document.getElementById("vid");            // null when no video
+
+// audio is the playback master; the muted video follows it.
+function sync(force) {{
+  if (!vid) return;
+  const t = au.currentTime || 0;
+  if (force || Math.abs(vid.currentTime - t) > 0.15) vid.currentTime = t;
+}}
 
 function update() {{
   const t = au.currentTime || 0;                       // crop-relative [s]
@@ -86,14 +106,18 @@ function update() {{
   head.style.display = "block";
   pos.textContent = "▶ " + (D.t0 + t).toFixed(2) + " s (セッション時刻)"
                   + " / 図をクリックでシーク";
+  sync(false);
 }}
 
 let raf = null;
 function loop() {{ update(); raf = requestAnimationFrame(loop); }}
-au.addEventListener("play",  () => {{ if (!raf) loop(); }});
-au.addEventListener("pause", () => {{ cancelAnimationFrame(raf); raf = null; update(); }});
-au.addEventListener("ended", () => {{ cancelAnimationFrame(raf); raf = null; update(); }});
-au.addEventListener("seeked", update);
+au.addEventListener("play",  () => {{ if (!raf) loop();
+                                      if (vid) {{ sync(true); vid.play().catch(() => {{}}); }} }});
+au.addEventListener("pause", () => {{ cancelAnimationFrame(raf); raf = null; update();
+                                      if (vid) {{ vid.pause(); sync(true); }} }});
+au.addEventListener("ended", () => {{ cancelAnimationFrame(raf); raf = null; update();
+                                      if (vid) vid.pause(); }});
+au.addEventListener("seeked", () => {{ update(); sync(true); }});
 
 wrap.addEventListener("click", (ev) => {{
   const r = wrap.getBoundingClientRect();
@@ -111,10 +135,17 @@ function fit() {{
 }}
 document.getElementById("fig").addEventListener("load", fit);
 window.addEventListener("resize", fit);
+// the video grows the layout only once its metadata arrives -> re-fit then
+if (vid) {{
+  vid.addEventListener("loadedmetadata", fit);
+  vid.addEventListener("loadeddata", fit);
+}}
+// catch any late layout change (font swap, slow data-URI decode, ...)
+new ResizeObserver(fit).observe(document.body);
 fit();
 update();
 </script>
 """
     # Initial guess before the auto-fit kicks in (assumes ~900px column).
-    est_height = int(900 * aspect) + 80
+    est_height = int(900 * aspect) + 80 + vid_h
     return html, est_height

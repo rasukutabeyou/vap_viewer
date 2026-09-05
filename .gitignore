@@ -1,1 +1,19 @@
+# Bundles are generated artefacts, not source: each is ~100 MB of npz/parquet
+# rebuilt from a checkpoint by build/extract_error_cases.py. bundles_legacy/ is
+# the pre-xspk set (leaky split, sign-flipped gaze) kept only for reference.
 bundles/
+bundles_legacy/
+
+# Viewer virtualenv (recreate with: python -m venv .venv &&
+# .venv/bin/pip install -r app/requirements.txt)
+.venv/
+
+# Export destination for the video-export button.
+exports/
+
+# Byte-compiled files. The four .pyc under app/lib/__pycache__ were committed
+# before this rule existed; `git rm -r --cached` was used to drop them.
+__pycache__/
+*.py[cod]
+
+.DS_Store
